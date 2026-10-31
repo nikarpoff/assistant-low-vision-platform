@@ -1,0 +1,18 @@
+{
+  "text": "",
+  "normalized": "",
+  "language": "ru",
+  "speech": false,
+  "audio_duration_ms": 1500,
+  "model": {
+    "backend": "gigaam",
+    "name": "v2_ctc",
+    "device": "cuda"
+  },
+  "timings": {
+    "decode_ms": 0.9,
+    "vad_ms": 4.4,
+    "total_ms": 5.6
+  },
+  "rtf": 0.004
+}

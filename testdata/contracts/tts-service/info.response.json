@@ -1,0 +1,14 @@
+{
+  "service": "tts-service",
+  "version": "0.1.0",
+  "git_sha": "3f2c1ab",
+  "backend": "silero",
+  "model": "v4_ru",
+  "device": "cpu",
+  "warmed_up": true,
+  "params": {
+    "voice": "xenia",
+    "sample_rate": 48000,
+    "cache_max_items": 256
+  }
+}

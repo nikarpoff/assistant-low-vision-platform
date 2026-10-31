@@ -1,0 +1,18 @@
+{
+  "service": "tts-service",
+  "backend": "silero",
+  "model": "v4_ru",
+  "device": "cpu",
+  "git_sha": "3f2c1ab",
+  "n": 50,
+  "warmup": 5,
+  "p50_ms": 142.3,
+  "p95_ms": 198.6,
+  "mean_ms": 148.9,
+  "std_ms": 17.2,
+  "hardware": {
+    "cpu": "AMD EPYC 7302",
+    "gpu": null
+  },
+  "started_at": "2026-11-01T10:00:00Z"
+}
