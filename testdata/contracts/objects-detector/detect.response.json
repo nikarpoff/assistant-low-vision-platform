@@ -1,0 +1,52 @@
+{
+  "image": {
+    "width": 640,
+    "height": 480
+  },
+  "objects": [
+    {
+      "label": "stairs",
+      "label_ru": "ступени",
+      "confidence": 0.81,
+      "box": {
+        "x1": 0.3,
+        "y1": 0.55,
+        "x2": 0.72,
+        "y2": 1.0
+      },
+      "direction": "ahead",
+      "distance": "near",
+      "distance_m": null,
+      "area": 0.189,
+      "key": true
+    },
+    {
+      "label": "chair",
+      "label_ru": "стул",
+      "confidence": 0.64,
+      "box": {
+        "x1": 0.02,
+        "y1": 0.4,
+        "x2": 0.2,
+        "y2": 0.75
+      },
+      "direction": "left",
+      "distance": "far",
+      "distance_m": null,
+      "area": 0.063,
+      "key": true
+    }
+  ],
+  "model": {
+    "backend": "ultralytics",
+    "name": "yoloe-11s-seg",
+    "imgsz": 640,
+    "device": "cuda"
+  },
+  "timings": {
+    "decode_ms": 2.1,
+    "inference_ms": 11.6,
+    "postprocess_ms": 0.7,
+    "total_ms": 15.0
+  }
+}
