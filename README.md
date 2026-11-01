@@ -1,2 +1,272 @@
 # assistant-low-vision-platform
-Platform for aggregating requests to models for assement to low vision persons
+
+Шлюз системы голосового описания сцены для людей с нарушениями зрения: принимает снимки и речь от мобильного приложения, вызывает сервисы ИИ-моделей и языковую модель и возвращает ответ речью.
+
+## Назначение
+
+Шлюз - единственная точка входа мобильного приложения (шаблон API Gateway):
+- держит с приложением WebSocket-сессию по протоколу `alv.v1`: снимки и аудио идут бинарными кадрами, команды и ответы - JSON-сообщениями;
+- вызывает сервисы [objects-detector](https://github.com/nikarpoff/objects-detector) (обнаружение объектов), [asr-service](https://github.com/nikarpoff/asr-service) (распознавание речи) и [tts-service](https://github.com/nikarpoff/tts-service) (синтез речи);
+- строит описание сцены по шаблону (`template`), языковой моделью по тексту (`llm`) или мультимодальной моделью по снимку (`vlm`). Языковая модель - облачный поставщик по OpenAI-совместимому API: Polza.ai напрямую или GigaChat через прокси gpt2giga;
+- в пассивном режиме предупреждает об опасностях по правилам, без языковой модели;
+- пишет журнал запросов и замеры этапов в PostgreSQL. Снимки и аудио не сохраняются никогда;
+- отдаёт метрики Prometheus, статистику по журналу и снимок конфигурации стенда.
+
+В репозитории также лежат развёртывание всей системы (`deployments/`), эталонные контракты сервисов (`testdata/contracts/`) и инструменты эксперимента. Требования - в [docs/spec.md](docs/spec.md).
+
+Состояние: версия 0.1.0 в разработке. Сейчас готов каркас: настройки, логгер, метрики, HTTP-сервер с `/health`, образ и CI. Протокол, конвейеры, журнал и остальные эндпоинты появятся следующими изменениями.
+
+## Стек технологий
+
+- **Язык**: Go 1.24
+- **HTTP**: gorilla/mux
+- **Конфигурация**: переменные окружения (caarlos0/env)
+- **Логирование**: собственный printf-логгер `internal/logger`
+- **Метрики**: prometheus/client_golang
+- **Валидация**: go-playground/validator
+- **Тесты**: testify (require), moq
+- **Образ**: distroless (`gcr.io/distroless/static-debian12:nonroot`), публикуется в `ghcr.io/nikarpoff/assistant-low-vision-platform`
+
+## Быстрый старт
+
+Без токенов и без языковой модели (режим `template`):
+
+```bash
+docker build -f build/Dockerfile -t alv-platform:dev .
+docker run --rm -p 127.0.0.1:8080:80 \
+  -e APP_AUTH_DISABLED=true -e APP_DESCRIBER_MODE=template \
+  alv-platform:dev
+curl http://127.0.0.1:8080/health
+```
+
+Без Docker:
+
+```bash
+APP_SERVER_PORT=8080 APP_AUTH_DISABLED=true APP_DESCRIBER_MODE=template go run ./cmd/gateway
+```
+
+## <a id="env"></a> Переменные окружения
+
+Все настройки - переменные окружения с рабочими значениями по умолчанию. Длительности с суффиксом `_MS` - в миллисекундах, с `_S` и `_TIMEOUT` - в секундах.
+
+Шлюз не стартует и пишет понятную ошибку, если:
+- `APP_DESCRIBER_MODE` не `template`, `llm` или `vlm`;
+- в режиме `llm` пуст `APP_LLM_MODEL`, в режиме `vlm` пусты и `APP_VLM_MODEL`, и `APP_LLM_MODEL`: идентификатор модели входит в `config_id`, поэтому значения по умолчанию у него нет;
+- в режимах `llm` и `vlm` `APP_LLM_URL` - не абсолютный адрес со схемой `http` или `https`;
+- `APP_AUTH_DISABLED` не `true`, а `APP_DEVICE_TOKENS` или `APP_ADMIN_TOKEN` пусты;
+- `APP_LOG_LEVEL` - не уровень логирования;
+- значение числовой или логической переменной не разбирается.
+
+Пустой `APP_LLM_API_KEY` допустим (заглушка поставщика), но в режимах `llm` и `vlm` при старте в лог пишется предупреждение. В режиме `template` настройки языковой модели не проверяются и не используются.
+
+### Сервер и логи
+
+| Переменная | Описание | По умолчанию | Обязательная |
+|---|---|---|---|
+| `APP_SERVER_PORT` | Порт HTTP и WebSocket | `80` | Нет |
+| `APP_SERVER_READ_TIMEOUT` | Таймаут чтения HTTP-запроса (сек) | `15` | Нет |
+| `APP_SERVER_WRITE_TIMEOUT` | Таймаут записи HTTP-ответа (сек) | `15` | Нет |
+| `APP_SERVER_IDLE_TIMEOUT` | Таймаут простоя keep-alive соединения (сек) | `60` | Нет |
+| `APP_SERVER_SHUTDOWN_TIMEOUT` | Сколько ждать активные запросы при остановке (сек) | `5` | Нет |
+| `APP_LOG_LEVEL` | Уровень логов: `DEBUG`, `INFO`, `WARNING`, `ERROR`. Тексты вопросов и ответов пишутся только на `DEBUG` | `INFO` | Нет |
+
+### Аутентификация
+
+| Переменная | Описание | По умолчанию | Обязательная |
+|---|---|---|---|
+| `APP_AUTH_DISABLED` | `true` - работа без токенов, только для разработки | `false` | Нет |
+| `APP_DEVICE_TOKENS` | Токены устройств через запятую | - | Да, если `APP_AUTH_DISABLED` не `true` |
+| `APP_ADMIN_TOKEN` | Токен `/v1/stats` и `/v1/config` | - | Да, если `APP_AUTH_DISABLED` не `true` |
+
+### Описание сцены
+
+| Переменная | Описание | По умолчанию | Обязательная |
+|---|---|---|---|
+| `APP_DESCRIBER_MODE` | Режим описания: `template`, `llm`, `vlm` | `llm` | Нет |
+| `APP_PLACEMENT` | Метка варианта размещения (`A`, `B`), входит в `config_id` | `dev` | Нет |
+| `APP_PROMPT` | Имя шаблона промпта | `default` | Нет |
+| `APP_MAX_ANSWER_CHARS` | Предельная длина ответа (символов) | `220` | Нет |
+| `APP_VLM_WITH_DETECTIONS` | В режиме `vlm` добавлять объекты детектора в промпт как подсказки | `true` | Нет |
+| `APP_SCENE_FRESHNESS_MS` | Сколько последняя сцена устройства годится для вопроса без снимка | `10000` | Нет |
+
+### Языковая модель
+
+| Переменная | Описание | По умолчанию | Обязательная |
+|---|---|---|---|
+| `APP_LLM_URL` | Базовый адрес OpenAI-совместимого API поставщика; к нему добавляются `/chat/completions` и `/models` | `https://polza.ai/api/v1` | Нет |
+| `APP_LLM_API_KEY` | Ключ поставщика (секрет): ключ Polza.ai или ключ доступа к gpt2giga | пусто | Нет |
+| `APP_LLM_MODEL` | Идентификатор модели для режима `llm` | пусто | Да, в режимах `llm` и `vlm` (если пуст `APP_VLM_MODEL`) |
+| `APP_VLM_MODEL` | Идентификатор мультимодальной модели для режима `vlm`; пусто - `APP_LLM_MODEL` | пусто | Нет |
+| `APP_LLM_TEMPERATURE` | Температура генерации | `0` | Нет |
+| `APP_LLM_SEED` | Seed генерации | `42` | Нет |
+| `APP_LLM_MAX_TOKENS` | Предел токенов ответа | `96` | Нет |
+| `APP_LLM_EXTRA_BODY` | JSON, добавляемый в тело запроса (например, выключение рассуждений) | `{}` | Нет |
+
+### Сервисы ИИ-моделей
+
+| Переменная | Описание | По умолчанию | Обязательная |
+|---|---|---|---|
+| `APP_DETECTOR_URL` | Адрес детектора | `http://detector:8000` | Нет |
+| `APP_DETECTOR_TOKEN` | Токен детектора (секрет) | пусто | Нет |
+| `APP_ASR_URL` | Адрес ASR | `http://asr:8000` | Нет |
+| `APP_ASR_TOKEN` | Токен ASR (секрет) | пусто | Нет |
+| `APP_TTS_URL` | Адрес TTS | `http://tts:8000` | Нет |
+| `APP_TTS_TOKEN` | Токен TTS (секрет) | пусто | Нет |
+| `APP_TTS_VOICE` | Голос TTS; пусто - голос сервиса по умолчанию | пусто | Нет |
+
+### Таймауты
+
+| Переменная | Описание | По умолчанию | Обязательная |
+|---|---|---|---|
+| `APP_DETECT_TIMEOUT_MS` | Вызов детектора | `400` | Нет |
+| `APP_ASR_TIMEOUT_MS` | Вызов ASR | `2000` | Нет |
+| `APP_LLM_TTFT_TIMEOUT_MS` | Первый токен языковой модели | `900` | Нет |
+| `APP_LLM_TOTAL_TIMEOUT_MS` | Вся генерация | `5000` | Нет |
+| `APP_TTS_FIRST_CHUNK_TIMEOUT_MS` | Первый аудиофрагмент предложения | `1000` | Нет |
+| `APP_REQUEST_DEADLINE_MS` | Весь пользовательский запрос | `8000` | Нет |
+| `APP_PASSIVE_DEADLINE_MS` | Пассивный запрос; дальше результат устарел | `1500` | Нет |
+
+### Пассивный режим, опасности, намерения, история
+
+| Переменная | Описание | По умолчанию | Обязательная |
+|---|---|---|---|
+| `APP_PASSIVE_NOTICES` | Озвучивать в пассивном режиме и уровень `notice` | `false` | Нет |
+| `APP_HAZARD_RULES_PATH` | YAML с правилами опасности; пусто - встроенные правила | пусто | Нет |
+| `APP_HAZARD_COOLDOWN_MS` | Как часто может повторяться одно предупреждение по паре «класс, направление» | `10000` | Нет |
+| `APP_INTENTS_PATH` | YAML с фразами намерений; пусто - встроенные фразы | пусто | Нет |
+| `APP_HISTORY_SCENES` | Сколько последних сцен устройства хранить | `5` | Нет |
+| `APP_HISTORY_TURNS` | Сколько последних реплик устройства хранить | `6` | Нет |
+| `APP_HISTORY_TTL_S` | Через сколько секунд без активности устройства история очищается | `600` | Нет |
+
+### Параметры приложения
+
+Шлюз передаёт их приложению в `welcome`.
+
+| Переменная | Описание | По умолчанию | Обязательная |
+|---|---|---|---|
+| `APP_IMAGE_MAX_SIDE` | Длинная сторона снимка (пикселей) | `640` | Нет |
+| `APP_JPEG_QUALITY` | Качество JPEG | `80` | Нет |
+| `APP_PASSIVE_INTERVAL_MS` | Интервал снимков пассивного режима | `3000` | Нет |
+| `APP_LISTEN_WINDOW_MS` | Окно ожидания речи | `5000` | Нет |
+| `APP_MAX_QUESTION_MS` | Наибольшая длительность вопроса | `15000` | Нет |
+| `APP_AUDIO_OUT_SAMPLE_RATE` | Частота аудио ответа (Гц) | `24000` | Нет |
+| `APP_MAX_IMAGE_BYTES` | Наибольший размер снимка (байт) | `2097152` | Нет |
+
+### Журнал и конфигурация стенда
+
+| Переменная | Описание | По умолчанию | Обязательная |
+|---|---|---|---|
+| `APP_POSTGRES_DSN` | Строка подключения к PostgreSQL; пусто - журнал выключен | пусто | Нет |
+| `APP_JOURNAL_BUFFER` | Ёмкость буфера записей журнала; при переполнении записи отбрасываются | `1024` | Нет |
+| `APP_CONFIG_REFRESH_S` | Период обновления снимка конфигурации (сек) | `60` | Нет |
+
+## Протокол `alv.v1`
+
+Приложение держит одно WebSocket-соединение `wss://<хост>/v1/session` с подпротоколом `alv.v1` и токеном устройства в `Authorization: Bearer <токен>`. Текстовые кадры - JSON-сообщения с полем `type` (от приложения - `hello`, `describe`, `ask.start`, `ask.end`, `cancel`, `client.metrics`; от Шлюза - `welcome`, `accepted`, `transcript`, `answer.start`, `answer.text`, `answer.end`, `error` и другие). Бинарные кадры - заголовок 22 байта (версия, вид, `request_id`, `seq`) и полезная нагрузка: JPEG снимка, PCM вопроса или PCM ответа.
+
+Полное описание - раздел PROTO в [docs/spec.md](docs/spec.md). Эталонные вектора кадров и сообщений, общие с приложением, - `testdata/protocol/vectors.json`.
+
+## HTTP API
+
+| Метод | Путь | Описание | Готово |
+|-------|------|----------|---|
+| GET | `/health` | Проверка живости, ответ `200` и текст `OK` | да |
+| GET | `/v1/session` | WebSocket-сессия приложения (протокол `alv.v1`) | нет |
+| GET | `/ready` | Готовность: статусы детектора, ASR, TTS, языковой модели, журнала и словаря; `503`, если обязательный сервис недоступен | нет |
+| GET | `/metrics` | Метрики Prometheus | нет |
+| GET | `/v1/stats` | Статистика по журналу: p50 и p95 этапов, доли деградации и откатов; админ-токен | нет |
+| GET | `/v1/config` | Снимок конфигурации стенда и `config_id`; админ-токен | нет |
+
+Подробности - PLT-13 в [docs/spec.md](docs/spec.md). Ошибка `500` всегда обезличена: `{"error": "internal server error"}`, подробности только в логе.
+
+### Метрики
+
+Все метрики объявлены в `internal/metrics` в собственном реестре:
+
+| Метрика | Тип | Метки |
+|---|---|---|
+| `alv_stage_duration_seconds` | гистограмма | `stage`, `kind` |
+| `alv_e2e_duration_seconds` | гистограмма | `kind`, `network` |
+| `alv_requests_total` | счётчик | `kind`, `status` |
+| `alv_upstream_errors_total` | счётчик | `upstream`, `reason` |
+| `alv_sessions_active` | показатель | - |
+| `alv_journal_dropped_total` | счётчик | - |
+
+## Схема базы данных
+
+Журнал хранится в PostgreSQL, колонки именуются в snake_case, миграции будут лежать в репозитории и применяться при старте. Сущности - `device`, `session`, `request`, `stage_timing`, `client_metric`, `config_snapshot` (PLT-11 в [docs/spec.md](docs/spec.md)). Схема появится вместе с журналом.
+
+## Разработка
+
+Подготовка машины - [docs/development.md](docs/development.md): Go 1.24.13 и moq ставит `scripts/setup-dev-env.sh`.
+
+### Запуск тестов
+
+Моки (`*_moq_test.go`) генерируются по директивам `//go:generate moq` и в git не попадают, поэтому на чистом клоне сначала нужны моки:
+
+```bash
+./scripts/regenerate-mocks.sh
+go test -p 1 ./...
+```
+
+### Проверки как в CI
+
+```bash
+./scripts/regenerate-mocks.sh
+test -z "$(gofmt -l .)"
+go vet ./...
+go test -p 1 ./...
+```
+
+CI (`.github/workflows/ci.yml`) делает то же на каждый pull request и на push в `dev`. Workflow `.github/workflows/release.yml` на push в `main` и на теги `v*` прогоняет тесты и публикует образ в `ghcr.io/nikarpoff/assistant-low-vision-platform` с тегами `latest` (только `main`), `sha-<7 символов>` и `v<semver>`.
+
+### Сборка
+
+```bash
+go build ./...
+docker build -f build/Dockerfile -t alv-platform:test .
+```
+
+Образ собирает все бинарники `cmd/*` в корень: `/gateway` - точка входа, остальные инструменты запускаются заменой `entrypoint`.
+
+### Контракты сервисов
+
+Этот репозиторий - источник истины для эталонных примеров сервисов (`testdata/contracts/<сервис>/`) и векторов протокола (`testdata/protocol/vectors.json`). Копии в репозиториях сервисов и приложения вручную не правятся:
+
+```bash
+scripts/sync-contracts.sh          # скопировать в соседние репозитории общего проекта
+scripts/sync-contracts.sh --check  # сверить копии, ненулевой код при расхождении
+```
+
+### Форматирование
+
+```bash
+gofmt -w .
+goimports -w .
+go vet ./...
+```
+
+## Структура проекта
+
+```
+cmd/gateway/main.go               # точка входа: логгер, конфигурация, HTTP-сервер, остановка по сигналу
+endpoints/httpserver/             # HTTP-сервер и регистрация маршрутов
+internal/env/                     # переменные окружения (Vars) и проверки при старте
+internal/logger/                  # printf-логгер: строки "<LEVEL>: <message>"
+internal/metrics/                 # метрики Prometheus в собственном реестре
+internal/utils/                   # валидатор запросов
+testdata/contracts/               # эталонные контракты сервисов ИИ-моделей
+testdata/protocol/                # вектора протокола alv.v1
+build/Dockerfile                  # сборка образа (distroless)
+.github/workflows/                # CI и публикация образа
+docs/spec.md                      # выдержка из спецификации системы
+docs/development.md               # подготовка машины разработки
+docs/changelog.md                 # изменения по версиям
+scripts/regenerate-mocks.sh       # регенерация моков
+scripts/sync-contracts.sh         # синхронизация контрактов с соседними репозиториями
+scripts/setup-dev-env.sh          # подготовка машины разработки
+```
+
+## Лицензия
+
+[Apache License 2.0](LICENSE).
