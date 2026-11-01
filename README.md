@@ -14,7 +14,7 @@
 
 В репозитории также лежат развёртывание всей системы (`deployments/`), эталонные контракты сервисов (`testdata/contracts/`) и инструменты эксперимента. Требования - в [docs/spec.md](docs/spec.md).
 
-Состояние: версия 0.1.0 в разработке. Сейчас готов каркас: настройки, логгер, метрики, HTTP-сервер с `/health`, образ и CI. Протокол, конвейеры, журнал и остальные эндпоинты появятся следующими изменениями.
+Состояние: версия 0.1.0 в разработке. Готовы каркас (настройки, логгер, метрики, HTTP-сервер с `/health`, образ и CI), журнал в PostgreSQL и статистика `/v1/stats` с проверкой админ-токена. Журнал и `/v1/stats` подключаются к конвейерам и маршрутам при сборке Шлюза; протокол, конвейеры и остальные эндпоинты появятся следующими изменениями.
 
 ## Стек технологий
 
@@ -23,6 +23,7 @@
 - **Конфигурация**: переменные окружения (caarlos0/env)
 - **Логирование**: собственный printf-логгер `internal/logger`
 - **Метрики**: prometheus/client_golang
+- **Журнал**: PostgreSQL, драйвер jackc/pgx v5 (`pgxpool`)
 - **Валидация**: go-playground/validator
 - **Тесты**: testify (require), moq
 - **Образ**: distroless (`gcr.io/distroless/static-debian12:nonroot`), публикуется в `ghcr.io/nikarpoff/assistant-low-vision-platform`
@@ -178,7 +179,7 @@ APP_SERVER_PORT=8080 APP_AUTH_DISABLED=true APP_DESCRIBER_MODE=template go run .
 
 | Переменная | Описание | По умолчанию | Обязательная |
 |---|---|---|---|
-| `APP_POSTGRES_DSN` | Строка подключения к PostgreSQL; пусто - журнал выключен | пусто | Нет |
+| `APP_POSTGRES_DSN` | Строка подключения к PostgreSQL, например `postgres://alv:<пароль>@postgres:5432/alv?sslmode=disable` (секрет: содержит пароль); пусто - журнал выключен, при старте в лог пишется предупреждение | пусто | Нет |
 | `APP_JOURNAL_BUFFER` | Ёмкость буфера записей журнала; при переполнении записи отбрасываются | `1024` | Нет |
 | `APP_CONFIG_REFRESH_S` | Период обновления снимка конфигурации (сек) | `60` | Нет |
 
@@ -196,10 +197,45 @@ APP_SERVER_PORT=8080 APP_AUTH_DISABLED=true APP_DESCRIBER_MODE=template go run .
 | GET | `/v1/session` | WebSocket-сессия приложения (протокол `alv.v1`) | нет |
 | GET | `/ready` | Готовность: статусы детектора, ASR, TTS, языковой модели, журнала и словаря; `503`, если обязательный сервис недоступен | нет |
 | GET | `/metrics` | Метрики Prometheus | нет |
-| GET | `/v1/stats` | Статистика по журналу: p50 и p95 этапов, доли деградации и откатов; админ-токен | нет |
+| GET | `/v1/stats` | Статистика по журналу: p50 и p95 этапов, доли деградации и откатов; админ-токен | обработчик готов, маршрут подключается при сборке Шлюза |
 | GET | `/v1/config` | Снимок конфигурации стенда и `config_id`; админ-токен | нет |
 
 Подробности - PLT-13 в [docs/spec.md](docs/spec.md). Ошибка `500` всегда обезличена: `{"error": "internal server error"}`, подробности только в логе.
+
+### GET /v1/stats
+
+Статистика по журналу для отчёта по конфигурации (PLT-13, EXP-5, EXP-8). Нужен заголовок `Authorization: Bearer <APP_ADMIN_TOKEN>`; без него или с другим токеном - `401` и `{"error": "unauthorized"}`. При `APP_AUTH_DISABLED=true` токен не проверяется.
+
+Параметры запроса, все необязательные; пустой параметр не фильтрует:
+
+| Параметр | Описание |
+|---|---|
+| `since` | Начало интервала по времени создания запроса, RFC 3339 (`2026-11-01T10:00:00Z`), включительно |
+| `until` | Конец интервала, RFC 3339, не включительно; должен быть позже `since` |
+| `kind` | Вид запроса: `describe` (по касанию), `ask`, `passive` |
+| `config_id` | Конфигурация стенда |
+
+```bash
+curl -H "Authorization: Bearer $APP_ADMIN_TOKEN" \
+  "http://127.0.0.1:8080/v1/stats?config_id=c9f2a1d0e3b4&since=2026-11-01T10:00:00Z&until=2026-11-01T12:00:00Z"
+```
+
+```json
+{"config_id":"c9f2a1d0e3b4","since":"2026-11-01T10:00:00Z","until":"2026-11-01T12:00:00Z","kind":null,"stages":{"detect_ms":{"n":300,"p50":38.1,"p95":61.0,"mean":40.2}},"e2e":{"describe":{"n":300,"p50":1310.0,"p95":1820.0,"mean":1350.4}},"degraded":{"llm_timeout":{"n":9,"share":0.03},"llm_unavailable":{"n":3,"share":0.01},"tts_unavailable":{"n":0,"share":0.0}},"llm_errors":{"timeout_ttft":9,"http_429":2,"insufficient_balance":1},"llm_fallback_share":0.04,"llm_models":{"fake/fake-llm":312}}
+```
+
+Форма ответа - контракт для инструментов эксперимента, её закрепляет копия примера `testdata/stats/stats.response.json`:
+- `config_id`, `since`, `until`, `kind` - применённые фильтры, `null` - фильтра нет; время - в UTC;
+- `stages` - для каждого этапа PLT-14 из журнала: число замеров `n`, `p50`, `p95` и среднее `mean` в мс;
+- `e2e` - то же по `trigger_to_first_audio_ms` из `client.metrics`, по видам запроса;
+- `degraded` - для каждого `degraded_reason` (`llm_timeout`, `llm_unavailable`, `tts_unavailable`, ключи есть всегда) число ответов и их доля от всех ответов выборки. Ответ - запрос, закончившийся `answer.end`, то есть со статусом `ok` или `degraded`;
+- `llm_errors` - число ответов по каждому виду отказа поставщика `llm_error` (PLT-15);
+- `llm_fallback_share` - доля откатов: ответы с `degraded_reason` `llm_timeout` или `llm_unavailable`, делённые на все ответы описания сцены в режимах `llm` и `vlm` (`describe` по касанию и `ask` с намерением `describe`, `describe_ahead` или `question`); `null`, если таких ответов нет;
+- `llm_models` - число запросов по каждому значению `model` из ответов поставщика.
+
+Перцентили считаются методом nearest-rank: `x[ceil(q·n)-1]` по отсортированной выборке; `p50`, `p95` и `mean` округлены до 0,1 мс. Долю откатов считает функция `stats.FallbackShare` - та же, что у `loadgen` и `score`.
+
+Коды ответа: `200`; `401` - нет админ-токена; `422` - неверный параметр (`{"error": "validation failed for fields: since"}`) или `until` не позже `since`; `503` - журнал выключен (`APP_POSTGRES_DSN` пуст); `500` - обезличенная внутренняя ошибка.
 
 ### Метрики
 
@@ -278,7 +314,23 @@ APP_SERVER_PORT=8080 APP_AUTH_DISABLED=true APP_DESCRIBER_MODE=template go run .
 
 ## Схема базы данных
 
-Журнал хранится в PostgreSQL, колонки именуются в snake_case, миграции будут лежать в репозитории и применяться при старте. Сущности - `device`, `session`, `request`, `stage_timing`, `client_metric`, `config_snapshot` (PLT-11 в [docs/spec.md](docs/spec.md)). Схема появится вместе с журналом.
+Журнал запросов хранится в PostgreSQL (PLT-11 в [docs/spec.md](docs/spec.md)), колонки именуются в snake_case. Снимки и аудио не сохраняются никогда: запрос хранит только размер полученного снимка.
+
+**Миграции.** SQL-файлы `migrations/NNNN_<имя>.sql` встраиваются в бинарник и применяются при старте журнала по порядку имён. Применённые версии записываются в таблицу `schema_migrations`; файл и запись о его версии выполняются одной неявной транзакцией, поэтому в файле нет `BEGIN` и `COMMIT`. Выпущенная миграция не меняется, изменение схемы - новый файл. Если база при старте недоступна, Шлюз работает дальше, а миграции повторяются перед следующей записью.
+
+**Запись.** Асинхронная: запрос кладёт запись в буфер ёмкостью `APP_JOURNAL_BUFFER` и не ждёт базу. Один писатель забирает записи пачками до 100 штук и пишет пачку одной транзакцией. Записи отбрасываются со счётчиком `alv_journal_dropped_total`, если буфер полон или база не ответила за 5 с. В лог в этих случаях пишется предупреждение не чаще раза в 10 с с числом отброшенных записей. Если база отклонила пачку (например, нарушено ограничение), записи пишутся по одной, и теряются только отклонённые. Повторные записи с тем же ключом игнорируются.
+
+Журнал пишется с потерями, поэтому внешние ключи связывают только строки одной записи: сессию с устройством, этапы - с запросом. Запросы потерянной сессии сохраняются.
+
+| Таблица | Колонки | Описание |
+|---|---|---|
+| `device` | `device_id` (PK), `first_seen_at`, `last_seen_at` | Устройство по псевдониму - случайному UUID приложения; первое и последнее появление |
+| `session` | `session_id` (PK, UUID), `device_id` (FK), `app_version`, `network`, `label`, `started_at`, `ended_at` | WebSocket-сессия; `label` - код участника испытаний (EXP-6), пусто - нет |
+| `request` | `request_id` (PK, UUID), `session_id`, `kind`, `describer_mode`, `intent`, `status`, `error_code`, `degraded_reason`, `image_bytes`, `transcript`, `answer_text`, `hazard`, `objects` (JSONB), `config_id`, `llm_model`, `llm_system_fingerprint`, `llm_error`, `created_at` | Запрос: вид (`describe`, `ask`, `passive`), режим описания, итоговый статус (`ok`, `degraded`, `error`, `cancelled`, `skipped`, `stale`, `clear`), поля поставщика языковой модели; индексы по `created_at`, (`config_id`, `created_at`) и `session_id` |
+| `stage_timing` | `request_id` (FK), `stage`, `duration_ms` | Длительность этапа PLT-14, мс |
+| `client_metric` | `request_id`, `name`, `value` | Метрика из `client.metrics` |
+| `config_snapshot` | `config_id` (PK), `config` (JSONB), `collected_at` | Снимок конфигурации PLT-12 без секретов и время, когда он собран впервые |
+| `schema_migrations` | `version` (PK), `applied_at` | Применённые миграции |
 
 ## Заглушка поставщика `cmd/fakellm`
 
@@ -328,6 +380,21 @@ go run ./cmd/fakellm --port 8090 --fail stream_error_after_sentence
 ```bash
 ./scripts/regenerate-mocks.sh
 go test -p 1 ./...
+```
+
+### Интеграционные тесты
+
+Репозиторий журнала проверяется на настоящем PostgreSQL. Тесты помечены тегом сборки `integration` и в обычный `go test ./...` не входят. Скрипт генерирует моки, поднимает `postgres:17-alpine` в Docker на свободном порту `127.0.0.1`, прогоняет `TestRepository` и удаляет контейнер при любом исходе:
+
+```bash
+./scripts/test-integration.sh
+```
+
+Нужны Docker, Go и moq. Образ меняет переменная `ALV_TEST_POSTGRES_IMAGE`. С уже запущенной базой тесты запускаются так (схема `public` базы очищается):
+
+```bash
+APP_TEST_POSTGRES_DSN="postgres://postgres:<пароль>@127.0.0.1:5432/alv_test?sslmode=disable" \
+  go test -tags integration -v -run '^TestRepository$' ./internal/journal/
 ```
 
 ### Проверки как в CI
@@ -386,8 +453,15 @@ internal/snapshot/                # снимок конфигурации сте
 internal/llm/                     # клиент языковой модели: SSE, виды отказов, таймауты
 internal/fakellm/                 # заглушка поставщика: поток в формате Polza.ai, режимы отказа, запись запросов
 internal/utils/                   # валидатор запросов
+internal/postgres/                # пул соединений pgx за интерфейсом для моков
+internal/journal/                 # журнал: записи, асинхронный писатель, репозиторий, миграции
+internal/stats/                   # перцентили, доля откатов и статистика /v1/stats
+internal/handlers/adminauth/      # проверка админ-токена /v1/stats и /v1/config
+internal/handlers/statshandler/   # обработчик GET /v1/stats
+migrations/                       # SQL-миграции журнала (встраиваются в бинарник)
 testdata/contracts/               # эталонные контракты сервисов ИИ-моделей
 testdata/protocol/                # вектора протокола alv.v1
+testdata/stats/                   # эталон ответа /v1/stats (пример PLT-13)
 build/Dockerfile                  # сборка образа (distroless)
 .github/workflows/                # CI и публикация образа
 docs/spec.md                      # выдержка из спецификации системы
@@ -396,6 +470,7 @@ docs/changelog.md                 # изменения по версиям
 scripts/regenerate-mocks.sh       # регенерация моков
 scripts/sync-contracts.sh         # синхронизация контрактов с соседними репозиториями
 scripts/setup-dev-env.sh          # подготовка машины разработки
+scripts/test-integration.sh       # интеграционные тесты журнала с PostgreSQL в Docker
 ```
 
 ## Лицензия
