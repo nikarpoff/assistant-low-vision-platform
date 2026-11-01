@@ -254,6 +254,7 @@ endpoints/httpserver/             # HTTP-сервер и регистрация 
 internal/env/                     # переменные окружения (Vars) и проверки при старте
 internal/logger/                  # printf-логгер: строки "<LEVEL>: <message>"
 internal/metrics/                 # метрики Prometheus в собственном реестре
+internal/protocol/                # протокол alv.v1: бинарные кадры, JSON-сообщения, коды ошибок
 internal/utils/                   # валидатор запросов
 testdata/contracts/               # эталонные контракты сервисов ИИ-моделей
 testdata/protocol/                # вектора протокола alv.v1
