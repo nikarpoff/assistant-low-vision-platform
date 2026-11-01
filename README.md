@@ -192,6 +192,68 @@ APP_SERVER_PORT=8080 APP_AUTH_DISABLED=true APP_DESCRIBER_MODE=template go run .
 | `alv_sessions_active` | показатель | - |
 | `alv_journal_dropped_total` | счётчик | - |
 
+## Сервисы ИИ-моделей
+
+Клиенты детектора, ASR и TTS лежат в `internal/upstream/{detector,asr,tts}` (PLT-15 в [docs/spec.md](docs/spec.md)):
+- у каждого сервиса свой пул keep-alive соединений, без прокси и без сжатия;
+- тела бинарные, без base64:
+  - снимок детектору - `image/jpeg` как есть;
+  - вопрос в ASR - `audio/L16; rate=16000; channels=1`;
+  - в TTS - JSON TTS-1 (`text`, `voice`, если задан `APP_TTS_VOICE`, `sample_rate` из `APP_AUDIO_OUT_SAMPLE_RATE`, `format: pcm_s16le`, `speed: 1.0`), ответ - поток `audio/L16`;
+- заголовки: `Authorization: Bearer <APP_*_TOKEN>` (при пустом токене не ставится) и `X-Request-ID` - UUID запроса приложения;
+- таймауты PLT-8:
+  - детектор - `APP_DETECT_TIMEOUT_MS`, ASR - `APP_ASR_TIMEOUT_MS` на весь вызов;
+  - TTS - `APP_TTS_FIRST_CHUNK_TIMEOUT_MS` до первого аудиофрагмента. Клиент возвращает поток, как только пришёл первый фрагмент, остальное ограничено только дедлайном запроса. Фрагменты содержат целые отсчёты (чётное число байт);
+  - `GET /v1/info` и `GET /v1/vocabulary` - 2 с;
+- повторов нет. Каждый отказ - типизированная ошибка и `+1` к `alv_upstream_errors_total{upstream, reason}`, где `upstream` - `detector`, `asr` или `tts`:
+
+| Что случилось | Ошибка | `reason` |
+|---|---|---|
+| ответ 503 (очередь сервиса заполнена) | `ErrBusy` | `busy` |
+| другой ответ 5xx, нет соединения, поток оборвался | `ErrUnavailable` | `unavailable` |
+| вызов или первый фрагмент TTS не уложился в таймаут | `ErrTimeout` | `timeout` |
+| ответ 401 (неверный токен сервиса) | `ErrUnauthorized` | `unauthorized` |
+| другой не-2xx ответ (400, 413, 415, 422) | `ErrRejected` | `rejected` |
+| ответ 2xx с другим `Content-Type`, битым JSON или пустым потоком | `ErrInvalidResponse` | `invalid_response` |
+
+Вызов, прерванный самим Шлюзом (отмена запроса или его дедлайн), отказом сервиса не считается и в счётчик не попадает. Поле `detail` ответа сервиса попадает в текст ошибки.
+
+### Словарь детектора
+
+`internal/vocabulary` (PLT-16, DET-2) загружает словарь при старте запросом `GET /v1/vocabulary`. Пока словарь не загружен, попытки повторяются с паузой, которая удваивается от 0,5 до 10 с; каждая неудача пишется в лог предупреждением. Словарь проверяется: уникальные `id` в snake_case, формы `one`, `few`, `many`, род `m`, `f`, `n` или `pl`, компилируемые шаблоны `mentions`.
+
+Словарь даёт:
+- форму названия для количества по правилам русского языка: 1 «стул», 2 «стула», 5 и 11 «стульев», 21 «стул»;
+- классы для проверки правил опасности;
+- сопоставитель упоминаний. Шаблоны `mentions` применяются к тексту, нормализованному по PLT-4, и оборачиваются в `(?:^| )(?:<шаблон>)(?: |$)`: RE2 не знает `\b` для кириллицы, поэтому границы слов - пробелы и края текста.
+
+## Конфигурация стенда и `config_id`
+
+`internal/snapshot` (PLT-12) собирает снимок конфигурации при старте и раз в `APP_CONFIG_REFRESH_S`. `config_id` - первые 12 hex-символов SHA-256 от канонического JSON снимка: ключи отсортированы, без пробелов, числа в исходной записи. Снимок отдаёт `GET /v1/config` в виде `{"config_id", "collected_at", "config"}`.
+
+```json
+{
+  "placement": "B",
+  "describer_mode": "llm",
+  "services": {"detector": <GET /v1/info>, "asr": <GET /v1/info>, "tts": <GET /v1/info>},
+  "llm": {"url": "https://polza.ai/api/v1", "model": "<APP_LLM_MODEL>"},
+  "prompt": {"name": "default", "hash": "<хеш шаблона промпта>"},
+  "generation": {"temperature": 0, "seed": 42, "max_tokens": 96, "extra_body": {}},
+  "timeouts_ms": {"detect": 400, "asr": 2000, "llm_ttft": 900, "llm_total": 5000, "tts_first_chunk": 1000, "request_deadline": 8000, "passive_deadline": 1500},
+  "hazard_rules_hash": "<хеш правил опасности>",
+  "intents_hash": "<хеш фраз намерений>",
+  "tts_voice": "",
+  "image": {"max_side": 640, "jpeg_quality": 80}
+}
+```
+
+- `placement` - метка варианта размещения `APP_PLACEMENT`, всегда на верхнем уровне: по ней сравниваются снимки вариантов A и B.
+- `llm` - только в режимах `llm` и `vlm`. `url` - схема, хост и путь `APP_LLM_URL` без логина, пароля, параметров запроса и завершающего `/`. `model` - `APP_LLM_MODEL`, а в режиме `vlm` - `APP_VLM_MODEL`, если он задан. Список `/models` поставщика и модель из его ответа в снимок не входят.
+- `extra_body` - разобранный `APP_LLM_EXTRA_BODY`: порядок ключей и пробелы на `config_id` не влияют. Не JSON-объект - ошибка старта.
+- Хеши промпта, правил опасности и фраз намерений передают пакеты, которые загружают эти файлы.
+- Если сервис не ответил на `/v1/info`, в снимке остаётся его последний известный ответ, поэтому короткий сбой не меняет `config_id`. До первого ответа на месте сервиса стоит `null`.
+- Секретов в снимке нет: ни токенов сервисов, устройств и админа, ни `APP_LLM_API_KEY`, ни `APP_POSTGRES_DSN`.
+
 ## Схема базы данных
 
 Журнал хранится в PostgreSQL, колонки именуются в snake_case, миграции будут лежать в репозитории и применяться при старте. Сущности - `device`, `session`, `request`, `stage_timing`, `client_metric`, `config_snapshot` (PLT-11 в [docs/spec.md](docs/spec.md)). Схема появится вместе с журналом.
@@ -255,6 +317,12 @@ internal/env/                     # переменные окружения (Var
 internal/logger/                  # printf-логгер: строки "<LEVEL>: <message>"
 internal/metrics/                 # метрики Prometheus в собственном реестре
 internal/protocol/                # протокол alv.v1: бинарные кадры, JSON-сообщения, коды ошибок
+internal/upstream/                # общий HTTP-клиент сервисов ИИ-моделей: пул, заголовки, таймауты, типизированные ошибки
+internal/upstream/detector/       # клиент детектора: /v1/detect, /v1/vocabulary, /v1/info
+internal/upstream/asr/            # клиент ASR: /v1/recognize, /v1/info
+internal/upstream/tts/            # клиент TTS: поток /v1/synthesize, /v1/info
+internal/vocabulary/              # словарь детектора: загрузка, формы количества, сопоставитель упоминаний
+internal/snapshot/                # снимок конфигурации стенда и config_id
 internal/utils/                   # валидатор запросов
 testdata/contracts/               # эталонные контракты сервисов ИИ-моделей
 testdata/protocol/                # вектора протокола alv.v1
