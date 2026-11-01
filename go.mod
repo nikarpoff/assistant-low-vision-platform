@@ -5,6 +5,7 @@ go 1.24.13
 require (
 	github.com/caarlos0/env/v6 v6.10.1
 	github.com/go-playground/validator/v10 v10.22.0
+	github.com/gorilla/mux v1.8.1
 	github.com/prometheus/client_golang v1.23.2
 	github.com/stretchr/testify v1.11.1
 )
