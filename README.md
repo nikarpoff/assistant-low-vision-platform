@@ -100,7 +100,29 @@ APP_SERVER_PORT=8080 APP_AUTH_DISABLED=true APP_DESCRIBER_MODE=template go run .
 | `APP_LLM_TEMPERATURE` | Температура генерации | `0` | Нет |
 | `APP_LLM_SEED` | Seed генерации | `42` | Нет |
 | `APP_LLM_MAX_TOKENS` | Предел токенов ответа | `96` | Нет |
-| `APP_LLM_EXTRA_BODY` | JSON, добавляемый в тело запроса (например, выключение рассуждений) | `{}` | Нет |
+| `APP_LLM_EXTRA_BODY` | JSON-объект, добавляемый в тело запроса (например, выключение рассуждений). Поля `model`, `messages`, `stream`, `temperature`, `seed`, `max_tokens` и `user` в нём запрещены: их задаёт клиент или они не передаются поставщику | `{}` | Нет |
+
+Клиент языковой модели (`internal/llm`) один для любого поставщика:
+- шлёт `POST <APP_LLM_URL>/chat/completions` с `stream: true`, моделью, сообщениями промпта, `temperature`, `seed`, `max_tokens` и полями `APP_LLM_EXTRA_BODY`;
+- из своих заголовков ставит только `Authorization: Bearer <APP_LLM_API_KEY>` (при пустом ключе не ставит), `Content-Type: application/json` и `Accept: text/event-stream`. `X-Request-ID`, `device_id`, `label` и поле `user` поставщику не передаются;
+- читает SSE построчно: комментарии и пустые строки пропускает, поле `error` проверяет в каждом фрагменте, `model` и `system_fingerprint` берёт из первого фрагмента, где они есть;
+- держит пул keep-alive соединений, проверяет TLS-сертификат по системным корневым сертификатам, не сжимает ответ, не следует перенаправлениям и не повторяет запрос;
+- первый токен ждёт не дольше `APP_LLM_TTFT_TIMEOUT_MS`, всю генерацию - не дольше `APP_LLM_TOTAL_TIMEOUT_MS`.
+
+Вид отказа (`reason`) пишется в журнал (`llm_error`) и в метрику `alv_upstream_errors_total{upstream="llm", reason}`:
+
+| `reason` | Что случилось |
+|---|---|
+| `insufficient_balance` | HTTP 402 до потока или событие ошибки в потоке с `code` `INSUFFICIENT_BALANCE`, `402` (число или строка) или `PAYMENT_REQUIRED` |
+| `http_429` | HTTP 429 до потока |
+| `http_5xx` | HTTP 500-599 до потока |
+| `http_4xx` | другой не-2xx статус до потока (400, 401, 403, 404, 408, 413, перенаправление) |
+| `stream_error` | HTTP 200 и фрагмент с полем `error` или `finish_reason: "error"`, даже если за ним пришёл `data: [DONE]` |
+| `disconnect` | соединение не установлено, закрылось или поток не прочитался до `[DONE]` и до фрагмента с `finish_reason` |
+| `empty` | нормальный конец без текста (или только с пробелами) |
+| `timeout_ttft` / `timeout_total` | нет первого токена за `APP_LLM_TTFT_TIMEOUT_MS` / генерация дольше `APP_LLM_TOTAL_TIMEOUT_MS` |
+
+В лог при отказе пишутся `request_id`, `reason`, HTTP-статус, `code` и `trace_id` поставщика, а при сетевом сбое - ошибка соединения. Текст ошибки поставщика не пишется никогда.
 
 ### Сервисы ИИ-моделей
 
@@ -258,6 +280,43 @@ APP_SERVER_PORT=8080 APP_AUTH_DISABLED=true APP_DESCRIBER_MODE=template go run .
 
 Журнал хранится в PostgreSQL, колонки именуются в snake_case, миграции будут лежать в репозитории и применяться при старте. Сущности - `device`, `session`, `request`, `stage_timing`, `client_metric`, `config_snapshot` (PLT-11 в [docs/spec.md](docs/spec.md)). Схема появится вместе с журналом.
 
+## Заглушка поставщика `cmd/fakellm`
+
+OpenAI-совместимая заглушка языковой модели для тестов и сквозной проверки без ключей и сети (PLT-19). Адрес для Шлюза - `APP_LLM_URL=http://<хост>:<порт>/v1`.
+
+- `POST /v1/chat/completions` - только `stream: true` (иначе `400 BAD_REQUEST`). Детерминированный текст потоком SSE в формате Polza.ai: комментарий `: PROCESSING`, фрагмент с ролью, после задержки первого токена - фрагменты `chat.completion.chunk` по словам с `model` и `system_fingerprint: fp_fake`, фрагмент с `finish_reason: "stop"`, фрагмент `usage` с пустым `choices`, `data: [DONE]`.
+- `GET /v1/models` - список из одной модели.
+- Ошибки - в формате Polza.ai: до потока `{"error": {"code": "...", "message": "...", "trace_id": "fake-trace"}, "trace_id": "fake-trace"}`, в потоке - фрагмент с `id` `error_fake`, полем `error`, `trace_id` и `finish_reason: "error"`, за которым идёт `data: [DONE]`.
+
+```bash
+go run ./cmd/fakellm --port 8090 --fail stream_error_after_sentence
+```
+
+Флаги главнее переменных окружения:
+
+| Переменная | Флаг | Описание | По умолчанию |
+|---|---|---|---|
+| `FAKELLM_PORT` | `--port` | Порт HTTP | `8000` |
+| `FAKELLM_MODEL` | `--model` | Модель во фрагментах и в `/v1/models` | `fake/fake-llm` |
+| `FAKELLM_API_KEY` | `--api-key` | Ключ: если задан, запрос без `Authorization: Bearer <ключ>` получает `401 UNAUTHORIZED` | пусто |
+| `FAKELLM_FIRST_TOKEN_DELAY_MS` | `--first-token-delay-ms` | Задержка первого токена (мс) | `0` |
+| `FAKELLM_TOKEN_DELAY_MS` | `--token-delay-ms` | Задержка между токенами (мс) | `0` |
+| `FAKELLM_FAIL` | `--fail` | Режим отказа, см. ниже | `none` |
+
+| `FAKELLM_FAIL` | Поведение |
+|---|---|
+| `none` | обычный поток |
+| `http_402` | до потока: 402, `code` `INSUFFICIENT_BALANCE` |
+| `http_429` | до потока: 429, `Retry-After: 1`, `code` `TOO_MANY_REQUESTS` |
+| `http_500` | до потока: 500, `code` `INTERNAL_ERROR` |
+| `stream_error_before_text` | статус 200, первым фрагментом - событие ошибки `SERVICE_UNAVAILABLE`, затем `[DONE]` |
+| `stream_error_after_sentence` | статус 200, первое предложение, событие ошибки `SERVICE_UNAVAILABLE`, `[DONE]` |
+| `stream_402_after_sentence` | статус 200, первое предложение, событие ошибки `INSUFFICIENT_BALANCE`, `[DONE]` |
+| `disconnect_after_sentence` | статус 200, первое предложение, затем обрыв соединения без `finish_reason` и `[DONE]` |
+| `empty` | статус 200, сразу фрагмент с `finish_reason: "stop"` и `[DONE]`, текста нет |
+
+Тесты поднимают заглушку в процессе: `httptest.NewServer(fakellm.NewServer(fakellm.Config{...}))`. `Config.Text` подменяет текст ответа, `Requests()` отдаёт полученные запросы (последние 256) с заголовками и телами.
+
 ## Разработка
 
 Подготовка машины - [docs/development.md](docs/development.md): Go 1.24.13 и moq ставит `scripts/setup-dev-env.sh`.
@@ -312,6 +371,7 @@ go vet ./...
 
 ```
 cmd/gateway/main.go               # точка входа: логгер, конфигурация, HTTP-сервер, остановка по сигналу
+cmd/fakellm/main.go               # заглушка поставщика языковой модели для тестов и сквозной проверки
 endpoints/httpserver/             # HTTP-сервер и регистрация маршрутов
 internal/env/                     # переменные окружения (Vars) и проверки при старте
 internal/logger/                  # printf-логгер: строки "<LEVEL>: <message>"
@@ -323,6 +383,8 @@ internal/upstream/asr/            # клиент ASR: /v1/recognize, /v1/info
 internal/upstream/tts/            # клиент TTS: поток /v1/synthesize, /v1/info
 internal/vocabulary/              # словарь детектора: загрузка, формы количества, сопоставитель упоминаний
 internal/snapshot/                # снимок конфигурации стенда и config_id
+internal/llm/                     # клиент языковой модели: SSE, виды отказов, таймауты
+internal/fakellm/                 # заглушка поставщика: поток в формате Polza.ai, режимы отказа, запись запросов
 internal/utils/                   # валидатор запросов
 testdata/contracts/               # эталонные контракты сервисов ИИ-моделей
 testdata/protocol/                # вектора протокола alv.v1
