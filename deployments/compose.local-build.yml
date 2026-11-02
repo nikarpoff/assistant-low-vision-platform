@@ -1,0 +1,42 @@
+# Override for ALV_LOCAL_BUILD=1: build the images from the sibling repositories of
+# the umbrella project instead of pulling them from the registry.
+#
+#   docker compose --env-file .env.example -f compose.fake.yml -f compose.local-build.yml up -d --build
+#
+# The model services are built with EXTRAS="" - the fake backend only: a light image
+# that builds fast. The base compose files do not depend on the sibling directories.
+
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: build/Dockerfile
+
+  fakellm:
+    build:
+      context: ..
+      dockerfile: build/Dockerfile
+
+  detector:
+    build:
+      context: ../../objects-detector
+      dockerfile: Dockerfile.cpu
+      args:
+        EXTRAS: ""
+        GIT_SHA: ${GIT_SHA:-local}
+
+  asr:
+    build:
+      context: ../../asr-service
+      dockerfile: Dockerfile.cpu
+      args:
+        EXTRAS: ""
+        GIT_SHA: ${GIT_SHA:-local}
+
+  tts:
+    build:
+      context: ../../tts-service
+      dockerfile: Dockerfile.cpu
+      args:
+        EXTRAS: ""
+        GIT_SHA: ${GIT_SHA:-local}

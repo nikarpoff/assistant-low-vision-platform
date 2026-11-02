@@ -1,0 +1,91 @@
+# Any machine without a GPU, weights and provider keys: gateway, PostgreSQL, the
+# model services on the fake backend and the provider stub cmd/fakellm (PLT-19).
+# Used by the end-to-end check e2e-smoke.sh (DEP-8).
+#
+#   docker compose --env-file .env.example -f compose.fake.yml up -d
+#   ALV_LOCAL_BUILD=1: add -f compose.local-build.yml and --build to build from the sibling repositories
+#
+# Only the gateway port is published, on 127.0.0.1:8080, so the stand does not clash
+# with the service containers on 8101-8103.
+
+services:
+  gateway:
+    extends:
+      file: compose.vm.yml
+      service: gateway
+    environment:
+      APP_PLACEMENT: dev
+      APP_LLM_URL: http://fakellm:8000/v1
+      APP_LLM_API_KEY: ""
+      APP_LLM_MODEL: fake/fake-llm
+      APP_VLM_MODEL: fake/fake-llm
+      APP_LLM_EXTRA_BODY: "{}"
+      APP_DETECTOR_URL: http://detector:8000
+      APP_ASR_URL: http://asr:8000
+      APP_TTS_URL: http://tts:8000
+      APP_POSTGRES_DSN: postgres://alv:${POSTGRES_PASSWORD:-alv-fake}@postgres:5432/alv?sslmode=disable
+    ports:
+      - "127.0.0.1:8080:80"
+
+  postgres:
+    extends:
+      file: compose.vm.yml
+      service: postgres
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-alv-fake}
+    volumes: !reset []
+
+  detector:
+    image: ghcr.io/nikarpoff/objects-detector:${ALV_IMAGE_TAG:-latest}-cpu
+    restart: unless-stopped
+    environment:
+      MODEL_BACKEND: fake
+      TARGET_PLATFORM: cpu
+      AUTH_TOKEN: ${DETECTOR_AUTH_TOKEN:-}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  asr:
+    image: ghcr.io/nikarpoff/asr-service:${ALV_IMAGE_TAG:-latest}-cpu
+    restart: unless-stopped
+    environment:
+      MODEL_BACKEND: fake
+      TARGET_PLATFORM: cpu
+      AUTH_TOKEN: ${ASR_AUTH_TOKEN:-}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  tts:
+    image: ghcr.io/nikarpoff/tts-service:${ALV_IMAGE_TAG:-latest}-cpu
+    restart: unless-stopped
+    environment:
+      MODEL_BACKEND: fake
+      TARGET_PLATFORM: cpu
+      AUTH_TOKEN: ${TTS_AUTH_TOKEN:-}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  fakellm:
+    image: ghcr.io/nikarpoff/assistant-low-vision-platform:${ALV_IMAGE_TAG:-latest}
+    entrypoint: ["/fakellm"]
+    restart: unless-stopped
+    environment:
+      FAKELLM_PORT: "8000"
+      FAKELLM_MODEL: fake/fake-llm
+
+# Compose creates the network itself: no manual `docker network create`
+networks:
+  default:
+    name: alv-net
