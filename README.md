@@ -317,6 +317,10 @@ go run ./cmd/fakellm --port 8090 --fail stream_error_after_sentence
 
 Тесты поднимают заглушку в процессе: `httptest.NewServer(fakellm.NewServer(fakellm.Config{...}))`. `Config.Text` подменяет текст ответа, `Requests()` отдаёт полученные запросы (последние 256) с заголовками и телами.
 
+## Развёртывание
+
+Файлы compose для вариантов размещения A и B и стенда на заглушках, Caddy с TLS, примеры туннеля WireGuard, прокси gpt2giga с сертификатом НУЦ, загрузка весов и живая проверка поставщиков - в [deployments/README.md](deployments/README.md).
+
 ## Разработка
 
 Подготовка машины - [docs/development.md](docs/development.md): Go 1.24.13 и moq ставит `scripts/setup-dev-env.sh`.
@@ -389,6 +393,7 @@ internal/utils/                   # валидатор запросов
 testdata/contracts/               # эталонные контракты сервисов ИИ-моделей
 testdata/protocol/                # вектора протокола alv.v1
 build/Dockerfile                  # сборка образа (distroless)
+deployments/                      # развёртывание всей системы: compose, Caddy, WireGuard, сертификат НУЦ, скрипты (deployments/README.md)
 .github/workflows/                # CI и публикация образа
 docs/spec.md                      # выдержка из спецификации системы
 docs/development.md               # подготовка машины разработки
