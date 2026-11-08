@@ -14,12 +14,12 @@
 
 В репозитории также лежат развёртывание всей системы (`deployments/`), эталонные контракты сервисов (`testdata/contracts/`) и инструменты эксперимента. Требования - в [docs/spec.md](docs/spec.md).
 
-Состояние: версия 0.1.0 в разработке. Готовы каркас (настройки, логгер, метрики, HTTP-сервер с `/health`, образ и CI), журнал в PostgreSQL и статистика `/v1/stats` с проверкой админ-токена. Журнал и `/v1/stats` подключаются к конвейерам и маршрутам при сборке Шлюза; протокол, конвейеры и остальные эндпоинты появятся следующими изменениями.
+Состояние: версия 0.1.0 в разработке. Готовы каркас (настройки, логгер, метрики, HTTP-сервер с `/health`, образ и CI), WebSocket-сессия `/v1/session` и конвейер описания по касанию, журнал в PostgreSQL и статистика `/v1/stats` с проверкой админ-токена. Вопрос, пассивный режим, полная цепочка деградации, подключение журнала, `/ready`, `/metrics`, `/v1/config` и `/v1/stats` появятся следующими изменениями.
 
 ## Стек технологий
 
 - **Язык**: Go 1.24
-- **HTTP**: gorilla/mux
+- **HTTP и WebSocket**: gorilla/mux, gorilla/websocket
 - **Конфигурация**: переменные окружения (caarlos0/env)
 - **Логирование**: собственный printf-логгер `internal/logger`
 - **Метрики**: prometheus/client_golang
@@ -101,10 +101,10 @@ APP_SERVER_PORT=8080 APP_AUTH_DISABLED=true APP_DESCRIBER_MODE=template go run .
 | `APP_LLM_TEMPERATURE` | Температура генерации | `0` | Нет |
 | `APP_LLM_SEED` | Seed генерации | `42` | Нет |
 | `APP_LLM_MAX_TOKENS` | Предел токенов ответа | `96` | Нет |
-| `APP_LLM_EXTRA_BODY` | JSON-объект, добавляемый в тело запроса (например, выключение рассуждений). Поля `model`, `messages`, `stream`, `temperature`, `seed`, `max_tokens` и `user` в нём запрещены: их задаёт клиент или они не передаются поставщику | `{}` | Нет |
+| `APP_LLM_EXTRA_BODY` | JSON-объект, добавляемый в тело запроса (например, выключение рассуждений). Поля `model`, `messages`, `stream`, `temperature`, `top_p`, `seed`, `max_tokens` и `user` в нём запрещены: их задаёт клиент или они не передаются поставщику | `{}` | Нет |
 
 Клиент языковой модели (`internal/llm`) один для любого поставщика:
-- шлёт `POST <APP_LLM_URL>/chat/completions` с `stream: true`, моделью, сообщениями промпта, `temperature`, `seed`, `max_tokens` и полями `APP_LLM_EXTRA_BODY`;
+- шлёт `POST <APP_LLM_URL>/chat/completions` с `stream: true`, моделью, сообщениями промпта, `temperature`, `top_p` (всегда 1, DSC-5), `seed`, `max_tokens` и полями `APP_LLM_EXTRA_BODY`;
 - из своих заголовков ставит только `Authorization: Bearer <APP_LLM_API_KEY>` (при пустом ключе не ставит), `Content-Type: application/json` и `Accept: text/event-stream`. `X-Request-ID`, `device_id`, `label` и поле `user` поставщику не передаются;
 - читает SSE построчно: комментарии и пустые строки пропускает, поле `error` проверяет в каждом фрагменте, `model` и `system_fingerprint` берёт из первого фрагмента, где они есть;
 - держит пул keep-alive соединений, проверяет TLS-сертификат по системным корневым сертификатам, не сжимает ответ, не следует перенаправлениям и не повторяет запрос;
@@ -189,12 +189,32 @@ APP_SERVER_PORT=8080 APP_AUTH_DISABLED=true APP_DESCRIBER_MODE=template go run .
 
 Полное описание - раздел PROTO в [docs/spec.md](docs/spec.md). Эталонные вектора кадров и сообщений, общие с приложением, - `testdata/protocol/vectors.json`.
 
+### Сессия
+
+`internal/session` (PLT-1) обслуживает `GET /v1/session`:
+- до upgrade проверяются токен устройства (`401 {"error": "unauthorized"}`, сравнение в постоянное время; при `APP_AUTH_DISABLED=true` токен не нужен) и подпротокол: клиент обязан предложить `alv.v1`, иначе `400`. Сжатие `permessage-deflate` выключено;
+- первое сообщение - `hello`. Ответ - `welcome` с `session_id`, `server_version`, `config_id` текущего снимка конфигурации и `config` для приложения (размер и качество снимка, интервал пассивного режима, окно и предел вопроса, форматы аудио). `hello` с другой версией `protocol` - `error` с кодом `unsupported_protocol` и закрытие с кодом 4001;
+- сообщение или кадр до `hello`, неизвестный `type`, кадр короче 22 байт, неизвестные версия или вид кадра, AUDIO_OUT от приложения, кадр без ожидающего его запроса - `error` с кодом `bad_request`, соединение не закрывается. Снимок больше `APP_MAX_IMAGE_BYTES`, фрагмент аудио больше 64 КиБ, вопрос длиннее `APP_MAX_QUESTION_MS` - `payload_too_large`, запрос завершается;
+- в сессии одна горутина чтения и одна записи. Новый пользовательский запрос (`describe` с `mode=on_demand` или `ask.start`) и `cancel` отменяют текущий: его вызовы сервисов прерываются, писатель отбрасывает все его сообщения и кадры, запрос считается со статусом `cancelled`. Пассивный запрос во время пользовательского или другого пассивного получает `passive.clear` с `reason=skipped`;
+- Шлюз шлёт ping каждые 15 с и закрывает соединение, если pong не пришёл за 30 с;
+- реестр сессий ведёт `alv_sessions_active`. По SIGTERM Шлюз перестаёт принимать сессии (`503`) и новые запросы (`busy`), даёт активным запросам до 5 с и закрывает сессии с кодом 1001 после уже поставленных в очередь сообщений.
+
+### Конвейер описания по касанию
+
+`internal/pipeline` (PLT-2, PLT-7, PLT-14): `describe` → снимок → `accepted` → детектор → описание сцены → поток предложений → TTS → AUDIO_OUT → `answer.end`.
+- Текст описания очищается (DSC-7): блоки `<think>...</think>`, символы `*`, `_`, `#`, `` ` ``, маркеры списков и эмодзи удаляются, пробелы схлопываются.
+- Поток режется на предложения после `.`, `!`, `?`, `…`, за которыми идёт пробел или конец потока. Предложение короче 12 символов склеивается со следующим, кроме последнего. В ответе не больше 3 предложений и `APP_MAX_ANSWER_CHARS` символов; при достижении предела поток языковой модели закрывается.
+- Каждое готовое предложение сразу уходит в TTS, одновременно не больше 2 синтезов на запрос. В приложение идут `answer.start`, затем для каждого предложения по порядку `answer.text` и его кадры AUDIO_OUT; номера кадров идут подряд через весь ответ.
+- `answer.end` содержит полный текст, объекты в фокусе (опасности первыми, `hazard=true` только для уровня `danger`), `hazard` и `timings`: `receive_ms`, `queue_ms`, `detect_ms`, `llm_ttft_ms`, `llm_first_sentence_ms`, `llm_total_ms` (режимы `llm` и `vlm`), `tts_first_chunk_ms`, `tts_total_ms`, `server_ttfa_ms`, `server_total_ms`. Те же этапы идут в `alv_stage_duration_seconds{stage, kind}`, итог запроса - в `alv_requests_total{kind, status}`.
+- Весь запрос ограничен `APP_REQUEST_DEADLINE_MS` от получения снимка: превышение до начала ответа - `error` с кодом `upstream_timeout`. Недоступный детектор - `detector_unavailable`. TTS, не давший звук, оставляет ответ без аудио (`answer.start` с `audio: null`, `degraded_reason=tts_unavailable`).
+- Собственная обработка Шлюза с заглушками сервисов без задержки укладывается в 15 мс p95 (PLT-18, тест `TestOverheadBudget`).
+
 ## HTTP API
 
 | Метод | Путь | Описание | Готово |
 |-------|------|----------|---|
 | GET | `/health` | Проверка живости, ответ `200` и текст `OK` | да |
-| GET | `/v1/session` | WebSocket-сессия приложения (протокол `alv.v1`) | нет |
+| GET | `/v1/session` | WebSocket-сессия приложения (протокол `alv.v1`), токен устройства | да |
 | GET | `/ready` | Готовность: статусы детектора, ASR, TTS, языковой модели, журнала и словаря; `503`, если обязательный сервис недоступен | нет |
 | GET | `/metrics` | Метрики Prometheus | нет |
 | GET | `/v1/stats` | Статистика по журналу: p50 и p95 этапов, доли деградации и откатов; админ-токен | обработчик готов, маршрут подключается при сборке Шлюза |
@@ -340,7 +360,7 @@ curl -H "Authorization: Bearer $APP_ADMIN_TOKEN" \
   "services": {"detector": <GET /v1/info>, "asr": <GET /v1/info>, "tts": <GET /v1/info>},
   "llm": {"url": "https://polza.ai/api/v1", "model": "<APP_LLM_MODEL>"},
   "prompt": {"name": "default", "hash": "<хеш шаблона промпта>"},
-  "generation": {"temperature": 0, "seed": 42, "max_tokens": 96, "extra_body": {}},
+  "generation": {"temperature": 0, "top_p": 1, "seed": 42, "max_tokens": 96, "extra_body": {}},
   "timeouts_ms": {"detect": 400, "asr": 2000, "llm_ttft": 900, "llm_total": 5000, "tts_first_chunk": 1000, "request_deadline": 8000, "passive_deadline": 1500},
   "hazard_rules_hash": "<хеш правил опасности>",
   "intents_hash": "<хеш фраз намерений>",
@@ -485,7 +505,7 @@ go vet ./...
 ## Структура проекта
 
 ```
-cmd/gateway/main.go               # точка входа: логгер, конфигурация, HTTP-сервер, остановка по сигналу
+cmd/gateway/main.go               # точка входа: логгер, конфигурация, запуск internal/app, остановка по сигналу
 cmd/fakellm/main.go               # заглушка поставщика языковой модели для тестов и сквозной проверки
 endpoints/httpserver/             # HTTP-сервер и регистрация маршрутов
 internal/env/                     # переменные окружения (Vars) и проверки при старте
@@ -505,6 +525,10 @@ internal/intent/                  # намерения: фразы команд,
 internal/hazard/                  # правила опасности, фразы предупреждений, cooldown
 internal/history/                 # история устройства: сцены, реплики, TTL
 internal/describer/               # описание сцены: шаблон, промпт, режимы llm и vlm
+internal/pipeline/                # конвейеры запросов: описание по касанию, поток предложений, TTS по порядку, этапы
+internal/session/                 # WebSocket-сессии: рукопожатие, кадры и сообщения, отмена, keepalive, реестр
+internal/app/                     # сборка Шлюза из настроек: клиенты, словарь, описатель, конвейеры, сессии
+internal/servicestub/             # заглушки детектора и TTS на httptest для тестов
 internal/utils/                   # валидатор запросов
 internal/postgres/                # пул соединений pgx за интерфейсом для моков
 internal/journal/                 # журнал: записи, асинхронный писатель, репозиторий, миграции
