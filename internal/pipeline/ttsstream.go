@@ -36,7 +36,9 @@ type Synthesizer interface {
 // spoken is a sentence on its way to the application: its text and the audio as it comes.
 type spoken struct {
 	seq  int
-	text string
+	text string // text of answer.text
+	// speak is the text sent to TTS: the text itself, or a warning phrase as the TTS cache knows it.
+	speak string
 	// ready is closed when the first audio chunk came or the synthesis failed.
 	ready chan struct{}
 	// chunks are the audio chunks; closed after the last one.
@@ -87,9 +89,17 @@ func newSpeech(ctx context.Context, synthesizer Synthesizer, requestID string, t
 // Say queues the sentence for synthesis. It is called from one goroutine; the dispatcher
 // takes every sentence, so the call does not block for long.
 func (s *speech) Say(text string) {
+	s.SayAs(text, text)
+}
+
+// SayAs queues the sentence whose answer.text is text and whose speech is synthesized
+// from speak: a warning phrase goes to TTS without the final period, as the TTS cache
+// is warmed with it (the service ends the phrase itself).
+func (s *speech) SayAs(speak, text string) {
 	sp := &spoken{
 		seq:    s.sentences,
 		text:   text,
+		speak:  speak,
 		ready:  make(chan struct{}),
 		chunks: make(chan []byte, 16),
 	}
@@ -145,7 +155,7 @@ func (s *speech) dispatch() {
 func (s *speech) synthesize(sp *spoken) {
 	defer func() { <-s.slots }()
 
-	stream, err := s.synthesizer.Synthesize(s.ctx, s.requestID, sp.text)
+	stream, err := s.synthesizer.Synthesize(s.ctx, s.requestID, sp.speak)
 	if err != nil {
 		sp.fail(err)
 		return

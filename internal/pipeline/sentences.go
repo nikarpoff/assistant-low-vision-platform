@@ -99,6 +99,24 @@ func (s *Sentences) Flush() []string {
 	return sentences
 }
 
+// Abort ends a broken stream (PLT-9): the sentences the stream completed go out - a
+// sentence ending right at the end of the stream is complete, as with Flush - and the
+// unfinished tail without an end of sentence is dropped.
+func (s *Sentences) Abort() []string {
+	if s.done {
+		return nil
+	}
+	clean := Cleanup(s.raw.String())
+	var sentences []string
+	rest := strings.TrimSpace(clean[min(s.offset, len(clean)):])
+	if last, _ := utf8.DecodeLastRuneInString(rest); rest != "" && strings.ContainsRune(sentenceEnds, last) {
+		sentences = s.add(sentences, rest)
+	}
+	sentences = s.flushCarry(sentences)
+	s.done = true
+	return sentences
+}
+
 // add joins the sentence with a waiting short one and gives it out unless it is still short.
 func (s *Sentences) add(sentences []string, sentence string) []string {
 	if sentence == "" {
