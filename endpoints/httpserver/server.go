@@ -19,14 +19,20 @@ type Server struct {
 	server *http.Server
 }
 
-// NewServer registers the routes and configures the HTTP server.
-func NewServer(vars *env.Vars) *Server {
+// sessionPath is the route of the WebSocket sessions of the application (PLT-1).
+const sessionPath = "/v1/session"
+
+// NewServer registers the routes and configures the HTTP server: GET /health and
+// GET /v1/session served by the session server.
+func NewServer(vars *env.Vars, sessions http.Handler) *Server {
 	router := mux.NewRouter()
 
 	router.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK"))
 	}).Methods(http.MethodGet)
+
+	router.Handle(sessionPath, sessions).Methods(http.MethodGet)
 
 	httpServer := &http.Server{
 		Addr:         fmt.Sprintf(":%d", vars.AppServerPort),
@@ -40,6 +46,11 @@ func NewServer(vars *env.Vars) *Server {
 		vars:   vars,
 		server: httpServer,
 	}
+}
+
+// Handler returns the router of the server.
+func (s *Server) Handler() http.Handler {
+	return s.server.Handler
 }
 
 // Run starts the HTTP server and blocks until it is stopped.
