@@ -115,7 +115,7 @@ func TestConfigSnapshot(t *testing.T) {
 			},
 			"llm": {"url": "https://polza.ai/api/v1", "model": "qwen/qwen3-30b-a3b"},
 			"prompt": {"name": "default", "hash": "5b1c0d9e8f7a"},
-			"generation": {"temperature": 0, "seed": 42, "max_tokens": 96, "extra_body": {}},
+			"generation": {"temperature": 0, "top_p": 1, "seed": 42, "max_tokens": 96, "extra_body": {}},
 			"timeouts_ms": {"detect": 400, "asr": 2000, "llm_ttft": 900, "llm_total": 5000, "tts_first_chunk": 1000, "request_deadline": 8000, "passive_deadline": 1500},
 			"hazard_rules_hash": "0a1b2c3d4e5f",
 			"intents_hash": "9f8e7d6c5b4a",
@@ -127,14 +127,14 @@ func TestConfigSnapshot(t *testing.T) {
 
 	t.Run("must_pass_canonical_extra_body", func(t *testing.T) {
 		setup(t)
-		vars.AppLLMExtraBody = `{"reasoning": {"enabled": false}, "top_p": 1.0, "stop": ["<end>"]}`
+		vars.AppLLMExtraBody = `{"reasoning": {"enabled": false}, "presence_penalty": 1.0, "stop": ["<end>"]}`
 		spaced := collect(t)
-		vars.AppLLMExtraBody = `{"stop":["<end>"],"top_p":1.0,"reasoning":{"enabled":false}}`
+		vars.AppLLMExtraBody = `{"stop":["<end>"],"presence_penalty":1.0,"reasoning":{"enabled":false}}`
 
 		compact := collect(t)
 
 		require.Equal(t, spaced.ConfigID, compact.ConfigID)
-		require.Contains(t, string(compact.Config), `"extra_body":{"reasoning":{"enabled":false},"stop":["<end>"],"top_p":1.0}`)
+		require.Contains(t, string(compact.Config), `"extra_body":{"presence_penalty":1.0,"reasoning":{"enabled":false},"stop":["<end>"]}`)
 	})
 
 	t.Run("must_pass_changes_on_llm_host", func(t *testing.T) {

@@ -27,7 +27,7 @@ const (
 	testAPIKey        = "test-key"
 	testRequestID     = "req-7f3c"
 	testModel         = "qwen/qwen3-8b"
-	testExtraBody     = `{"reasoning":{"enabled":false},"top_p":0.9}`
+	testExtraBody     = `{"reasoning":{"enabled":false},"presence_penalty":0.5}`
 	testFirstSentence = "Впереди стол и два стула."
 	testTraceID       = "test-trace"
 )
@@ -131,10 +131,11 @@ func TestLLMClient(t *testing.T) {
 			],
 			"stream": true,
 			"temperature": 0,
+			"top_p": 1,
 			"seed": 42,
 			"max_tokens": 96,
 			"reasoning": {"enabled": false},
-			"top_p": 0.9
+			"presence_penalty": 0.5
 		}`, string(recorded[0].Body))
 		require.Equal(t, "Bearer "+testAPIKey, recorded[0].Header.Get("Authorization"))
 		require.Equal(t, "application/json", recorded[0].Header.Get("Content-Type"))

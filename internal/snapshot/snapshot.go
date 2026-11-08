@@ -68,6 +68,7 @@ type Prompt struct {
 // Generation are the generation parameters of the language model (DSC-5).
 type Generation struct {
 	Temperature float64        `json:"temperature"`
+	TopP        float64        `json:"top_p"` // fixed at 1 (DSC-5)
 	Seed        int            `json:"seed"`
 	MaxTokens   int            `json:"max_tokens"`
 	ExtraBody   map[string]any `json:"extra_body"` // APP_LLM_EXTRA_BODY
