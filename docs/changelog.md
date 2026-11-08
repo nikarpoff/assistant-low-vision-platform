@@ -29,3 +29,9 @@
 - Добавлен клиент языковой модели `internal/llm` для любого OpenAI-совместимого поставщика: запрос с `stream: true`, параметрами генерации и `APP_LLM_EXTRA_BODY`, только заголовки `Authorization`, `Content-Type` и `Accept`, чтение SSE с комментариями и фрагментом `usage`, проверка поля `error` в каждом фрагменте, `model` и `system_fingerprint` из ответа, таймауты первого токена и всей генерации, виды отказа PLT-15 в метрике `alv_upstream_errors_total{upstream="llm"}`, без повторов и с проверкой TLS.
 - Добавлена заглушка поставщика `cmd/fakellm` (`internal/fakellm`): поток SSE в формате Polza.ai, `/v1/models`, ключ, задержки и модель из флагов и переменных `FAKELLM_*`, все режимы отказа `FAKELLM_FAIL`, запись полученных запросов для тестов.
 - README дополнен описанием клиента языковой модели, видов отказа поставщика и заглушки `cmd/fakellm`.
+- Добавлена нормализация текста `internal/textnorm` по PLT-4 и ASR-4; проходит все случаи `testdata/contracts/asr-service/normalize.cases.json`.
+- Добавлено распознавание намерений `internal/intent`: фразы команд из `configs/intents.yaml` (или `APP_INTENTS_PATH`), «пожалуйста» в начале или в конце, остальной непустой текст - `question`, хеш файла для `config_id`.
+- Добавлены правила опасности `internal/hazard` и файл `configs/hazard_rules.yaml` с правилами по умолчанию PLT-6: проверка классов по словарю детектора с именем правила в ошибке, уровни `danger` и `notice`, фразы предупреждений, совпадающие с контрактом прогрева TTS, cooldown по паре «класс, направление» с исключением `far` → `near`, хеш файла для `config_id`.
+- Добавлена история устройства `internal/history`: последние сцены и реплики по `device_id`, лимиты `APP_HISTORY_SCENES` и `APP_HISTORY_TURNS`, очистка через `APP_HISTORY_TTL_S` после последней активности.
+- Добавлена зависимость `gopkg.in/yaml.v3` v3.0.1 как прямая.
+- README дополнен разделом о намерениях, правилах опасности и истории.
