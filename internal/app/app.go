@@ -49,10 +49,12 @@ type App struct {
 	vars      *env.Vars
 	metrics   *metrics.Metrics
 	detector  *detector.Client
+	asr       *asr.Client
 	tts       *tts.Client
 	llm       *llm.Client
 	prompt    *describer.Prompt
 	rules     *hazard.Rules
+	intents   *intent.Matcher
 	history   *history.Store
 	collector *snapshot.Collector
 	loader    *vocabulary.Loader
@@ -78,8 +80,7 @@ func NewApp(vars *env.Vars) (*App, error) {
 	if a.detector, err = detector.NewClient(vars, a.metrics); err != nil {
 		return nil, fmt.Errorf(errBuildFormat, err)
 	}
-	asrClient, err := asr.NewClient(vars, a.metrics)
-	if err != nil {
+	if a.asr, err = asr.NewClient(vars, a.metrics); err != nil {
 		return nil, fmt.Errorf(errBuildFormat, err)
 	}
 	if a.tts, err = tts.NewClient(vars, a.metrics); err != nil {
@@ -100,8 +101,7 @@ func NewApp(vars *env.Vars) (*App, error) {
 	if a.rules, err = hazard.LoadRules(vars.AppHazardRulesPath); err != nil {
 		return nil, fmt.Errorf(errBuildFormat, err)
 	}
-	intents, err := intent.LoadMatcher(vars.AppIntentsPath)
-	if err != nil {
+	if a.intents, err = intent.LoadMatcher(vars.AppIntentsPath); err != nil {
 		return nil, fmt.Errorf(errBuildFormat, err)
 	}
 	a.history, err = history.NewStore(vars.AppHistoryScenes, vars.AppHistoryTurns, time.Duration(vars.AppHistoryTTLS)*time.Second, time.Now)
@@ -112,8 +112,8 @@ func NewApp(vars *env.Vars) (*App, error) {
 	a.collector, err = snapshot.NewCollector(vars, snapshot.Hashes{
 		Prompt:      promptHash,
 		HazardRules: a.rules.Hash(),
-		Intents:     intents.Hash(),
-	}, snapshot.Sources{Detector: a.detector, ASR: asrClient, TTS: a.tts})
+		Intents:     a.intents.Hash(),
+	}, snapshot.Sources{Detector: a.detector, ASR: a.asr, TTS: a.tts})
 	if err != nil {
 		return nil, fmt.Errorf(errBuildFormat, err)
 	}
@@ -207,6 +207,8 @@ func (a *App) buildPipelines(ctx context.Context) error {
 
 	a.pipelines.set(pipeline.NewPipeline(pipeline.NewConfig(a.vars), pipeline.Dependencies{
 		Detector:    a.detector,
+		Recognizer:  a.asr,
+		Intents:     a.intents,
 		Synthesizer: a.tts,
 		Describer:   sceneDescriber,
 		History:     a.history,

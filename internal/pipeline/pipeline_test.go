@@ -15,6 +15,7 @@ import (
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/env"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/hazard"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/history"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/intent"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/journal"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/llm"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/logger"
@@ -22,6 +23,7 @@ import (
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/protocol"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/servicestub"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/snapshot"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/upstream/asr"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/upstream/detector"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/upstream/tts"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/vocabulary"
@@ -115,40 +117,103 @@ func readVocabulary(t *testing.T) *vocabulary.Vocabulary {
 	return vocab
 }
 
-// testPipeline is a pipeline over the service stubs and a scripted language model.
+// testPipeline is a pipeline over the service stubs and a scripted language model or fakellm.
 type testPipeline struct {
-	pipeline *Pipeline
-	detector *servicestub.Detector
-	tts      *servicestub.TTS
-	metrics  *metrics.Metrics
-	recorder *RecorderMock
-	sink     *recordingSink
+	pipeline  *Pipeline
+	detector  *servicestub.Detector
+	asr       *servicestub.ASR
+	tts       *servicestub.TTS
+	describer *describer.Describer
+	history   *history.Store
+	metrics   *metrics.Metrics
+	recorder  *RecorderMock
+	sink      *recordingSink
+}
+
+// pipelineOptions are the settings of a test pipeline that differ from the defaults.
+type pipelineOptions struct {
+	mode env.DescriberMode
+	// completer is the language model; nil - llm.Client to llmURL (fakellm).
+	completer         describer.Completer
+	llmURL            string
+	llmTTFTMS         int
+	llmTotalMS        int
+	maxAnswerChars    int
+	requestDeadlineMS int
+	passiveDeadlineMS int
+	passiveNotices    bool
 }
 
 // newTestPipeline builds the pipeline in the llm mode with the scripted completer.
 func newTestPipeline(t *testing.T, completer describer.Completer, maxAnswerChars int) *testPipeline {
 	t.Helper()
+	return newTestPipelineWith(t, pipelineOptions{completer: completer, maxAnswerChars: maxAnswerChars})
+}
+
+// newTestPipelineWith builds the pipeline over the service stubs with the options.
+func newTestPipelineWith(t *testing.T, opts pipelineOptions) *testPipeline {
+	t.Helper()
 	detectorStub := servicestub.NewDetector()
+	asrStub := servicestub.NewASR()
 	ttsStub := servicestub.NewTTS()
 	t.Cleanup(detectorStub.Close)
+	t.Cleanup(asrStub.Close)
 	t.Cleanup(ttsStub.Close)
 
 	vars := &env.Vars{
 		AppDescriberMode:          env.DescriberModeLLM,
 		AppLLMModel:               testModel,
+		AppLLMURL:                 opts.llmURL,
+		AppLLMTTFTTimeoutMS:       900,
+		AppLLMTotalTimeoutMS:      5000,
+		AppLLMExtraBody:           "{}",
 		AppDetectorURL:            detectorStub.URL,
 		AppDetectTimeoutMS:        1000,
+		AppASRURL:                 asrStub.URL,
+		AppASRTimeoutMS:           1000,
 		AppTTSURL:                 ttsStub.URL,
 		AppTTSFirstChunkTimeoutMS: 1000,
 		AppAudioOutSampleRate:     24000,
-		AppMaxAnswerChars:         maxAnswerChars,
+		AppMaxAnswerChars:         220,
 		AppRequestDeadlineMS:      8000,
+		AppPassiveDeadlineMS:      1500,
+		AppPassiveNotices:         opts.passiveNotices,
+		AppHazardCooldownMS:       10000,
+		AppSceneFreshnessMS:       10000,
 	}
+	if opts.mode != "" {
+		vars.AppDescriberMode = opts.mode
+	}
+	if opts.llmTTFTMS > 0 {
+		vars.AppLLMTTFTTimeoutMS = opts.llmTTFTMS
+	}
+	if opts.llmTotalMS > 0 {
+		vars.AppLLMTotalTimeoutMS = opts.llmTotalMS
+	}
+	if opts.maxAnswerChars > 0 {
+		vars.AppMaxAnswerChars = opts.maxAnswerChars
+	}
+	if opts.requestDeadlineMS > 0 {
+		vars.AppRequestDeadlineMS = opts.requestDeadlineMS
+	}
+	if opts.passiveDeadlineMS > 0 {
+		vars.AppPassiveDeadlineMS = opts.passiveDeadlineMS
+	}
+
 	m := metrics.NewMetrics()
 	detectorClient, err := detector.NewClient(vars, m)
 	require.NoError(t, err)
+	asrClient, err := asr.NewClient(vars, m)
+	require.NoError(t, err)
 	ttsClient, err := tts.NewClient(vars, m)
 	require.NoError(t, err)
+
+	completer := opts.completer
+	if completer == nil && vars.AppDescriberMode != env.DescriberModeTemplate {
+		client, err := llm.NewClient(llm.NewConfig(vars), m)
+		require.NoError(t, err)
+		completer = client
+	}
 
 	vocab := readVocabulary(t)
 	rules, err := hazard.LoadRules("")
@@ -159,12 +224,16 @@ func newTestPipeline(t *testing.T, completer describer.Completer, maxAnswerChars
 	require.NoError(t, err)
 	sceneDescriber, err := describer.NewDescriber(describer.NewConfig(vars), vocab, policy, prompt, completer)
 	require.NoError(t, err)
+	intents, err := intent.LoadMatcher("")
+	require.NoError(t, err)
 	store, err := history.NewStore(5, 6, time.Minute, time.Now)
 	require.NoError(t, err)
 
 	recorder := &RecorderMock{WriteFunc: func(journal.Record) {}}
 	p := NewPipeline(NewConfig(vars), Dependencies{
 		Detector:    detectorClient,
+		Recognizer:  asrClient,
+		Intents:     intents,
 		Synthesizer: ttsClient,
 		Describer:   sceneDescriber,
 		History:     store,
@@ -175,7 +244,80 @@ func newTestPipeline(t *testing.T, completer describer.Completer, maxAnswerChars
 		}},
 		Metrics: m,
 	})
-	return &testPipeline{pipeline: p, detector: detectorStub, tts: ttsStub, metrics: m, recorder: recorder, sink: &recordingSink{}}
+	return &testPipeline{
+		pipeline:  p,
+		detector:  detectorStub,
+		asr:       asrStub,
+		tts:       ttsStub,
+		describer: sceneDescriber,
+		history:   store,
+		metrics:   m,
+		recorder:  recorder,
+		sink:      &recordingSink{},
+	}
+}
+
+// lastRecord returns the last request record of the journal.
+func (tp *testPipeline) lastRecord(t *testing.T) *journal.Request {
+	t.Helper()
+	calls := tp.recorder.WriteCalls()
+	require.NotEmpty(t, calls)
+	record, ok := calls[len(calls)-1].Record.(*journal.Request)
+	require.True(t, ok)
+	return record
+}
+
+// messages returns the messages the sink got, without the audio frames.
+func (s *recordingSink) messages() []protocol.Message {
+	messages := []protocol.Message{}
+	for _, e := range s.all() {
+		if e.message != nil {
+			messages = append(messages, e.message)
+		}
+	}
+	return messages
+}
+
+// frames returns the number of AUDIO_OUT frames the sink got.
+func (s *recordingSink) frames() int {
+	frames := 0
+	for _, e := range s.all() {
+		if e.message == nil {
+			frames++
+		}
+	}
+	return frames
+}
+
+// last returns the last message the sink got.
+func (s *recordingSink) last(t *testing.T) protocol.Message {
+	t.Helper()
+	messages := s.messages()
+	require.NotEmpty(t, messages)
+	return messages[len(messages)-1]
+}
+
+// find returns the first message of the type T.
+func find[T protocol.Message](t *testing.T, s *recordingSink) T {
+	t.Helper()
+	for _, message := range s.messages() {
+		if m, ok := message.(T); ok {
+			return m
+		}
+	}
+	var zero T
+	t.Fatalf("no message of type %T", zero)
+	return zero
+}
+
+// wait waits for the request to finish.
+func wait(t *testing.T, done <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(testTimeout):
+		t.Fatalf("%s did not finish", what)
+	}
 }
 
 // describe runs one describe request and waits for its end.
@@ -400,6 +542,25 @@ func TestSentences(t *testing.T) {
 		got, _ := push("Да. Нет. Впереди стол. ")
 
 		require.Equal(t, []string{"Да. Нет. Впереди стол."}, got)
+	})
+
+	t.Run("must_pass_abort_keeps_complete_sentences", func(t *testing.T) {
+		setup(220)
+
+		got, _ := push("Впереди стол и два стула.")
+
+		require.Empty(t, got)
+		require.Equal(t, []string{"Впереди стол и два стула."}, sentences.Abort())
+		require.Nil(t, sentences.Flush())
+	})
+
+	t.Run("must_pass_abort_drops_tail", func(t *testing.T) {
+		setup(220)
+
+		got, _ := push("Впереди стол и два стула. Да. Слева две")
+
+		require.Equal(t, []string{"Впереди стол и два стула."}, got)
+		require.Equal(t, []string{"Да."}, sentences.Abort())
 	})
 
 	t.Run("must_pass_first_sentence_cut_at_limit", func(t *testing.T) {

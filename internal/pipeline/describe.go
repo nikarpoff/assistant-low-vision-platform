@@ -27,6 +27,7 @@ import (
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/metrics"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/protocol"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/snapshot"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/upstream/asr"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/upstream/detector"
 )
 
@@ -91,11 +92,27 @@ type SceneDescriber interface {
 	Template(in *describer.Input, onText llm.TextHandler) (*describer.Result, error)
 }
 
-//go:generate moq -out history_reader_moq_test.go . HistoryReader
+//go:generate moq -out history_store_moq_test.go . HistoryStore
 
-// HistoryReader gives the history of a device (*history.Store).
-type HistoryReader interface {
+// HistoryStore keeps the history of a device (*history.Store, PLT-10).
+type HistoryStore interface {
 	Get(deviceID string) history.History
+	AddScene(deviceID string, scene history.Scene)
+	AddTurn(deviceID string, turns ...history.Turn)
+}
+
+//go:generate moq -out speech_recognizer_moq_test.go . SpeechRecognizer
+
+// SpeechRecognizer transcribes the question (*asr.Client).
+type SpeechRecognizer interface {
+	Recognize(ctx context.Context, requestID string, pcm []byte) (*asr.RecognizeResponse, error)
+}
+
+//go:generate moq -out intent_recognizer_moq_test.go . IntentRecognizer
+
+// IntentRecognizer gives the intent of the transcript (*intent.Matcher, PLT-4).
+type IntentRecognizer interface {
+	Recognize(text string) (protocol.Intent, error)
 }
 
 //go:generate moq -out recorder_moq_test.go . Recorder
@@ -120,6 +137,14 @@ type Config struct {
 	RequestDeadline time.Duration
 	// AudioOut is the audio format of answer.start when TTS does not name its sample rate.
 	AudioOut protocol.AudioFormat
+	// PassiveDeadline is APP_PASSIVE_DEADLINE_MS: an older passive result is stale (PROTO-8).
+	PassiveDeadline time.Duration
+	// PassiveNotices is APP_PASSIVE_NOTICES: the passive mode also speaks the level notice (PLT-5).
+	PassiveNotices bool
+	// HazardCooldown is APP_HAZARD_COOLDOWN_MS: the period of one warning by class and direction (PLT-6).
+	HazardCooldown time.Duration
+	// SceneFreshness is APP_SCENE_FRESHNESS_MS: a question without a snapshot uses a younger last scene (PLT-3).
+	SceneFreshness time.Duration
 }
 
 // NewConfig takes the settings of the pipelines from the gateway configuration.
@@ -132,30 +157,49 @@ func NewConfig(vars *env.Vars) Config {
 			SampleRate: vars.AppAudioOutSampleRate,
 			Channels:   1,
 		},
+		PassiveDeadline: time.Duration(vars.AppPassiveDeadlineMS) * time.Millisecond,
+		PassiveNotices:  vars.AppPassiveNotices,
+		HazardCooldown:  time.Duration(vars.AppHazardCooldownMS) * time.Millisecond,
+		SceneFreshness:  time.Duration(vars.AppSceneFreshnessMS) * time.Millisecond,
 	}
 }
 
 // Dependencies are the services and the state the pipelines use.
 type Dependencies struct {
 	Detector    ObjectDetector
+	Recognizer  SpeechRecognizer
+	Intents     IntentRecognizer
 	Synthesizer Synthesizer
 	Describer   SceneDescriber
-	History     HistoryReader
+	History     HistoryStore
 	Policy      *hazard.Policy
 	Recorder    Recorder
 	Config      ConfigSource
 	Metrics     *metrics.Metrics
 }
 
-// Pipeline runs the requests of all sessions. It has no state of its own.
+// Pipeline runs the requests of all sessions. Its own state is the hazard cooldowns of
+// the devices and the requests in progress of the sessions (PROTO-8).
 type Pipeline struct {
 	cfg  Config
 	deps Dependencies
+	// now is the clock of the hazard cooldowns (time.Now outside the tests).
+	now func() time.Time
+
+	mu        sync.Mutex
+	cooldowns map[string]*deviceCooldown // device_id -> cooldown
+	sessions  map[string]*inProgress     // session_id -> requests in progress
 }
 
 // NewPipeline creates the pipelines.
 func NewPipeline(cfg Config, deps Dependencies) *Pipeline {
-	return &Pipeline{cfg: cfg, deps: deps}
+	return &Pipeline{
+		cfg:       cfg,
+		deps:      deps,
+		now:       time.Now,
+		cooldowns: map[string]*deviceCooldown{},
+		sessions:  map[string]*inProgress{},
+	}
 }
 
 // DescribeRequest is a describe request with its snapshot (PROTO-6).
@@ -174,6 +218,7 @@ type DescribeRequest struct {
 // TTS and AUDIO_OUT, then answer.end with the timings. accepted is sent by the session.
 // It returns when the request is over; a cancelled request sends nothing more.
 func (p *Pipeline) Describe(ctx context.Context, req *DescribeRequest, sink Sink) {
+	defer p.beginUser(req.SessionID)()
 	r := p.newRun(ctx, KindDescribe, req.RequestID, req.SessionID, req.ReceivedAt, sink)
 	defer r.cancel()
 	r.timings.Set(StageReceive, req.ReceivedAt.Sub(req.StartedAt))
@@ -186,21 +231,38 @@ func (p *Pipeline) Describe(ctx context.Context, req *DescribeRequest, sink Sink
 	detectStarted := time.Now()
 	detected, err := p.deps.Detector.Detect(r.ctx, r.id, req.Image)
 	r.timings.Set(StageDetect, time.Since(detectStarted))
-	if err != nil {
-		r.fail(protocol.NewError(protocol.CodeDetectorUnavailable, errDetectorUnavailable), err)
+	objects, ok := p.detection(r, detected, err)
+	if !ok {
 		p.finish(r)
 		return
 	}
 
 	in := &describer.Input{
 		RequestID: r.id,
-		Objects:   detected.Objects,
+		Objects:   objects,
 		Focus:     req.Focus,
 		History:   p.deps.History.Get(req.DeviceID),
 		Image:     req.Image,
 	}
-	p.respond(r, in, protocol.AnswerKindDescription)
+	if text, answered := p.respond(r, in, protocol.AnswerKindDescription); answered {
+		p.deps.History.AddScene(req.DeviceID, history.Scene{Objects: objects, Description: text, At: req.ReceivedAt})
+	}
 	p.finish(r)
+}
+
+// detection returns the objects of the detector. A failed detector fails the request
+// with detector_unavailable in the template and llm modes; in the vlm mode the scene is
+// described from the snapshot alone, with no objects (PLT-9, DSC-6).
+func (p *Pipeline) detection(r *run, detected *detector.DetectResponse, err error) ([]detector.Object, bool) {
+	if err == nil {
+		return detected.Objects, true
+	}
+	if p.deps.Describer.Mode() == env.DescriberModeVLM && r.ctx.Err() == nil {
+		logger.Warning("object detector failed, the vlm mode describes the snapshot alone: request_id=%s error=%v", r.id, err)
+		return nil, true
+	}
+	r.fail(protocol.NewError(protocol.CodeDetectorUnavailable, errDetectorUnavailable), err)
+	return nil, false
 }
 
 // run is the state of one request in a pipeline.
@@ -215,9 +277,13 @@ type run struct {
 	timings  *Timings
 	record   *journal.Request
 	intent   protocol.Intent
+	priority protocol.Priority
+	// staleAt is when a passive result gets stale (PROTO-8); zero for a user request.
+	staleAt time.Time
 
 	mu             sync.Mutex
 	started        bool // answer.start is sent
+	stale          bool // the passive answer got stale before answer.start
 	audio          bool // the answer goes with audio
 	frames         uint32
 	sentences      []string
@@ -238,6 +304,7 @@ func (p *Pipeline) newRun(ctx context.Context, kind string, id uuid.UUID, sessio
 		sink:     sink,
 		received: received,
 		timings:  NewTimings(),
+		priority: protocol.PriorityNormal,
 		record: &journal.Request{
 			RequestID:     id.String(),
 			SessionID:     sessionID,
@@ -252,8 +319,10 @@ func (p *Pipeline) newRun(ctx context.Context, kind string, id uuid.UUID, sessio
 
 // respond describes the scene and sends the answer: answer.start, then answer.text and
 // the audio of every sentence, then answer.end (PROTO-6). The answer is limited by the
-// sentence stream of PLT-7; the language model stream is closed at the limit.
-func (p *Pipeline) respond(r *run, in *describer.Input, kind protocol.AnswerKind) {
+// sentence stream of PLT-7; the language model stream is closed at the limit. A failure
+// of the provider degrades the answer by PLT-9 (degrade.go). It returns the text of the
+// answer and whether answer.end is sent.
+func (p *Pipeline) respond(r *run, in *describer.Input, kind protocol.AnswerKind) (string, bool) {
 	objects := p.sceneObjects(in.Objects, in.Focus)
 	sentences := NewSentences(p.cfg.MaxAnswerChars)
 	speech := newSpeech(r.ctx, p.deps.Synthesizer, r.id, r.timings)
@@ -265,9 +334,10 @@ func (p *Pipeline) respond(r *run, in *describer.Input, kind protocol.AnswerKind
 	}()
 
 	llmStarted := time.Now()
+	fromLLM := p.deps.Describer.Mode() != env.DescriberModeTemplate
 	say := func(texts []string) {
 		for _, text := range texts {
-			if speech.Count() == 0 && p.deps.Describer.Mode() != env.DescriberModeTemplate {
+			if speech.Count() == 0 && fromLLM {
 				r.timings.SetOnce(StageLLMFirstSentence, time.Since(llmStarted))
 			}
 			logger.Debug("sentence ready: request_id=%s seq=%d text=%s", r.id, speech.Count(), text)
@@ -287,35 +357,56 @@ func (p *Pipeline) respond(r *run, in *describer.Input, kind protocol.AnswerKind
 	if result != nil && result.LLM != nil {
 		p.llmTimings(r, result.LLM)
 	}
-	if err == nil {
+	switch failure := providerFailure(err); {
+	case err == nil:
 		say(sentences.Flush())
+	case failure != nil && r.ctx.Err() == nil:
+		r.record.LLMError = string(failure.Reason)
+		r.degrade(degradedReason(failure))
+		// The sentences the stream completed are ready; the unfinished tail is dropped
+		say(sentences.Abort())
+		if speech.Count() > 0 {
+			logger.Warning("language model failed after the first sentence, the answer is closed with the ready sentences: request_id=%s reason=%s sentences=%d",
+				r.id, failure.Reason, speech.Count())
+			err = nil
+			break
+		}
+		logger.Warning("language model failed before the first sentence, the answer is built by the template: request_id=%s reason=%s", r.id, failure.Reason)
+		fromLLM = false
+		sentences = NewSentences(p.cfg.MaxAnswerChars)
+		if result, err = p.deps.Describer.Template(in, onText); err == nil {
+			say(sentences.Flush())
+		}
 	}
 	speech.Close()
 	<-emitted
 	if r.cancelled() || r.rejected() {
-		return
+		return "", false
+	}
+	if r.isStale() {
+		return "", false
 	}
 
 	switch {
 	case r.ctx.Err() != nil && !r.answerStarted():
 		r.fail(protocol.NewError(protocol.CodeUpstreamTimeout, errDeadlineExceeded), context.Cause(r.ctx))
-		return
+		return "", false
 	case err != nil && !r.answerStarted():
 		r.fail(protocol.NewError(protocol.CodeInternal, errDescribeFailed), err)
-		return
+		return "", false
 	case err != nil:
 		logger.Warning("scene description stopped after the first sentence: request_id=%s error=%v", r.id, err)
 	}
 	if !r.answerStarted() {
 		r.fail(protocol.NewError(protocol.CodeInternal, errDescribeFailed), errors.New(errNoSentences))
-		return
+		return "", false
 	}
 
 	hasHazard := false
 	if result != nil {
 		hasHazard = result.Hazard
 	}
-	p.end(r, objects, hasHazard)
+	return p.end(r, objects, hasHazard), true
 }
 
 // emit sends the sentences in order: answer.start before the first one, then for every
@@ -330,6 +421,16 @@ func (p *Pipeline) emit(r *run, speech *speech, kind protocol.AnswerKind) {
 		}
 
 		r.mu.Lock()
+		if !r.started && !r.staleAt.IsZero() && !time.Now().Before(r.staleAt) {
+			// The passive result came too late: nothing of it is sent (PROTO-8)
+			r.stale = true
+		}
+		if r.stale {
+			r.mu.Unlock()
+			speech.Stop()
+			drain(sp)
+			continue
+		}
 		if !r.started {
 			r.started = true
 			var audio *protocol.AudioFormat
@@ -341,7 +442,7 @@ func (p *Pipeline) emit(r *run, speech *speech, kind protocol.AnswerKind) {
 				audio = &format
 				r.audio = true
 			}
-			r.sink.Send(&protocol.AnswerStart{RequestID: r.uuid, Kind: kind, Priority: protocol.PriorityNormal, Audio: audio})
+			r.sink.Send(&protocol.AnswerStart{RequestID: r.uuid, Kind: kind, Priority: r.priority, Audio: audio})
 		}
 		r.mu.Unlock()
 		if sp.failed != nil {
@@ -383,12 +484,12 @@ func (p *Pipeline) ttsFailed(r *run, speech *speech, err error) {
 		logger.Warning("speech synthesis failed, the answer goes on without audio: request_id=%s error=%v", r.id, err)
 	}
 	r.audio = false
-	r.degradedReason = protocol.DegradedTTSUnavailable
+	r.degradeLocked(protocol.DegradedTTSUnavailable)
 	speech.Stop()
 }
 
-// end sends answer.end with the whole text, the objects and the timings.
-func (p *Pipeline) end(r *run, objects []protocol.SceneObject, hasHazard bool) {
+// end sends answer.end with the whole text, the objects and the timings, and returns the text.
+func (p *Pipeline) end(r *run, objects []protocol.SceneObject, hasHazard bool) string {
 	r.mu.Lock()
 	text := strings.Join(r.sentences, " ")
 	reason := r.degradedReason
@@ -419,6 +520,7 @@ func (p *Pipeline) end(r *run, objects []protocol.SceneObject, hasHazard bool) {
 	logger.Info("request answered: request_id=%s kind=%s status=%s sentences=%d server_total_ms=%.1f",
 		r.id, r.kind, r.status, len(r.sentences), float64(protocol.DurationMillis(time.Since(r.received))))
 	logger.Debug("answer text: request_id=%s text=%s", r.id, text)
+	return text
 }
 
 // fail sends the error of the request unless it is cancelled; cause goes to the log only.
@@ -446,6 +548,14 @@ func (r *run) answerStarted() bool {
 // cancelled reports whether the application cancelled the request.
 func (r *run) cancelled() bool {
 	return errors.Is(context.Cause(r.ctx), ErrCancelled)
+}
+
+// isStale reports whether the passive answer got stale before answer.start.
+func (r *run) isStale() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.stale
 }
 
 // rejected reports whether the session ended the request with an error of its own.

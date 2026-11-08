@@ -1,5 +1,5 @@
 // Package servicestub runs the model services in-process for the tests of the
-// pipelines, the sessions and the whole gateway: a detector and a TTS on
+// pipelines, the sessions and the whole gateway: a detector, an ASR and a TTS on
 // httptest with the answers of the reference contracts (testdata/contracts),
 // without delays unless a test asks for them.
 package servicestub
@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/textnorm"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/upstream/detector"
 )
 
@@ -26,6 +27,7 @@ const (
 	pathVocabulary = "/v1/vocabulary"
 	pathInfo       = "/v1/info"
 	pathSynthesize = "/v1/synthesize"
+	pathRecognize  = "/v1/recognize"
 )
 
 // Audio of the TTS stub.
@@ -169,6 +171,99 @@ func (d *Detector) detect(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, body)
+}
+
+// ASR is an in-process asr-service: /v1/recognize answers recognize.response.json of the
+// contract with the text the test sets; an empty text is the answer without speech
+// (recognize.silence.response.json).
+type ASR struct {
+	// URL is the base URL of the stub.
+	URL string
+
+	server  *httptest.Server
+	info    []byte
+	speech  map[string]any
+	silence map[string]any
+
+	mu     sync.Mutex
+	text   string
+	fail   bool
+	bodies [][]byte
+}
+
+// NewASR starts the ASR stub; it recognizes the text of the contract until SetText.
+func NewASR() *ASR {
+	a := &ASR{info: mustRead("asr-service", "info.response.json")}
+	if err := json.Unmarshal(mustRead("asr-service", "recognize.response.json"), &a.speech); err != nil {
+		panic(err)
+	}
+	if err := json.Unmarshal(mustRead("asr-service", "recognize.silence.response.json"), &a.silence); err != nil {
+		panic(err)
+	}
+	a.text, _ = a.speech["text"].(string)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc(pathRecognize, a.recognize)
+	mux.HandleFunc(pathInfo, func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, a.info) })
+	a.server = httptest.NewServer(mux)
+	a.URL = a.server.URL
+	return a
+}
+
+// SetText sets the recognized text; empty - no speech.
+func (a *ASR) SetText(text string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.text = text
+}
+
+// Fail makes every recognition answer 500.
+func (a *ASR) Fail(fail bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.fail = fail
+}
+
+// Bodies returns the audio of the recognition requests in the order they came.
+func (a *ASR) Bodies() [][]byte {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return append([][]byte(nil), a.bodies...)
+}
+
+// Close stops the stub.
+func (a *ASR) Close() {
+	a.server.CloseClientConnections()
+	a.server.Close()
+}
+
+func (a *ASR) recognize(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+
+	a.mu.Lock()
+	a.bodies = append(a.bodies, body)
+	text := a.text
+	fail := a.fail
+	a.mu.Unlock()
+
+	if fail {
+		writeError(w, http.StatusInternalServerError)
+		return
+	}
+	response := a.silence
+	if text != "" {
+		response = map[string]any{}
+		for key, value := range a.speech {
+			response[key] = value
+		}
+		response["text"] = text
+		response["normalized"] = textnorm.Normalize(text)
+	}
+	encoded, _ := json.Marshal(response)
+	writeJSON(w, encoded)
 }
 
 // TTS is an in-process tts-service: every sentence is ChunksPerSentence chunks of
