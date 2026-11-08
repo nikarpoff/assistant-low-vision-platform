@@ -1,0 +1,20 @@
+# WireGuard on the models machine (DEP-5): /etc/wireguard/wg0.conf, up with
+# `wg-quick up wg0` before compose, because compose publishes the ports on 10.77.0.2.
+# The machine is behind NAT, so it is the initiator: Endpoint is the public IP of the
+# VM and the keepalive holds the NAT mapping open.
+#
+# Keys: `wg genkey | tee models.key | wg pubkey > models.pub`; the private key stays
+# on this host and never goes to git.
+
+[Interface]
+# ALV_TUNNEL_MODELS_IP
+Address = 10.77.0.2/24
+PrivateKey = <private key of the models machine: contents of models.key>
+
+[Peer]
+# VM
+PublicKey = <public key of the VM: contents of vm.pub>
+Endpoint = <public IP of the VM>:51820
+# ALV_TUNNEL_VM_IP
+AllowedIPs = 10.77.0.1/32
+PersistentKeepalive = 25

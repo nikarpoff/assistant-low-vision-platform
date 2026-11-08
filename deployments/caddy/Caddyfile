@@ -1,0 +1,29 @@
+# TLS reverse proxy to the gateway (DEP-4). Used by compose.vm.yml (variant B,
+# upstream gateway:80 in alv-net) and compose.vm-proxy.yml (variant A, upstream
+# 10.77.0.2:8080 through the tunnel).
+#
+# The certificate is issued and renewed by Let's Encrypt automatically: the A record
+# of ALV_DOMAIN points to the public IP of the VM, ports 80 and 443 are open.
+{
+	servers {
+		# The app speaks HTTP/1.1 WebSocket; no HTTP/3, so no UDP port is needed
+		protocols h1 h2
+	}
+}
+
+{$ALV_DOMAIN} {
+	tls {
+		protocols tls1.2 tls1.3
+	}
+
+	reverse_proxy {$ALV_GATEWAY_UPSTREAM} {
+		# No buffering: answer audio and WebSocket frames go through at once
+		flush_interval -1
+
+		transport http {
+			# The gateway pings every 15 s; a read waits at least 120 s
+			read_timeout 120s
+			write_timeout 120s
+		}
+	}
+}

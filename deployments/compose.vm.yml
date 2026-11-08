@@ -1,0 +1,159 @@
+# Variant B, VM: Caddy (TLS), gateway, PostgreSQL and gpt2giga (profile gigachat).
+# The models run on the models machine (compose.models.yml) behind the WireGuard tunnel.
+#
+#   docker compose --env-file .env --env-file reference.env -f compose.vm.yml up -d
+#   docker compose --env-file .env --env-file reference.env -f compose.vm.yml --profile gigachat up -d
+#
+# Settings come only from --env-file through ${VAR:-default}: there is no env_file,
+# so the file is valid on a clean clone without .env. compose.single.yml extends the
+# gateway, postgres and gpt2giga services of this file, so variants A and B share them.
+
+services:
+  caddy:
+    image: caddy:2.11.7-alpine
+    restart: unless-stopped
+    depends_on:
+      - gateway
+    environment:
+      ALV_DOMAIN: ${ALV_DOMAIN:-alv.example.com}
+      ALV_GATEWAY_UPSTREAM: ${ALV_GATEWAY_UPSTREAM:-gateway:80}
+    # The only ports open on external interfaces: ACME, redirect and HTTPS
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  gateway:
+    image: ghcr.io/nikarpoff/assistant-low-vision-platform:${ALV_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    # The gateway starts without the model services: /ready shows when they are up
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Server and logs
+      APP_SERVER_PORT: "80"
+      APP_LOG_LEVEL: ${APP_LOG_LEVEL:-INFO}
+      # Authentication
+      APP_AUTH_DISABLED: ${APP_AUTH_DISABLED:-false}
+      APP_DEVICE_TOKENS: ${APP_DEVICE_TOKENS:-}
+      APP_ADMIN_TOKEN: ${APP_ADMIN_TOKEN:-}
+      # Scene description
+      APP_DESCRIBER_MODE: ${APP_DESCRIBER_MODE:-llm}
+      APP_PLACEMENT: ${APP_PLACEMENT:-B}
+      APP_PROMPT: ${APP_PROMPT:-default}
+      APP_MAX_ANSWER_CHARS: ${APP_MAX_ANSWER_CHARS:-220}
+      APP_VLM_WITH_DETECTIONS: ${APP_VLM_WITH_DETECTIONS:-true}
+      APP_SCENE_FRESHNESS_MS: ${APP_SCENE_FRESHNESS_MS:-10000}
+      # Language model provider
+      APP_LLM_URL: ${APP_LLM_URL:-https://polza.ai/api/v1}
+      APP_LLM_API_KEY: ${APP_LLM_API_KEY:-}
+      APP_LLM_MODEL: ${APP_LLM_MODEL:-}
+      APP_VLM_MODEL: ${APP_VLM_MODEL:-}
+      APP_LLM_TEMPERATURE: ${APP_LLM_TEMPERATURE:-0}
+      APP_LLM_SEED: ${APP_LLM_SEED:-42}
+      APP_LLM_MAX_TOKENS: ${APP_LLM_MAX_TOKENS:-96}
+      APP_LLM_EXTRA_BODY: '${APP_LLM_EXTRA_BODY:-{}}'
+      # Model services on the models machine, through the tunnel
+      APP_DETECTOR_URL: http://${ALV_TUNNEL_MODELS_IP:-10.77.0.2}:8101
+      APP_DETECTOR_TOKEN: ${DETECTOR_AUTH_TOKEN:-}
+      APP_ASR_URL: http://${ALV_TUNNEL_MODELS_IP:-10.77.0.2}:8102
+      APP_ASR_TOKEN: ${ASR_AUTH_TOKEN:-}
+      APP_TTS_URL: http://${ALV_TUNNEL_MODELS_IP:-10.77.0.2}:8103
+      APP_TTS_TOKEN: ${TTS_AUTH_TOKEN:-}
+      APP_TTS_VOICE: ${APP_TTS_VOICE:-}
+      # Timeouts, milliseconds
+      APP_DETECT_TIMEOUT_MS: ${APP_DETECT_TIMEOUT_MS:-400}
+      APP_ASR_TIMEOUT_MS: ${APP_ASR_TIMEOUT_MS:-2000}
+      APP_LLM_TTFT_TIMEOUT_MS: ${APP_LLM_TTFT_TIMEOUT_MS:-900}
+      APP_LLM_TOTAL_TIMEOUT_MS: ${APP_LLM_TOTAL_TIMEOUT_MS:-5000}
+      APP_TTS_FIRST_CHUNK_TIMEOUT_MS: ${APP_TTS_FIRST_CHUNK_TIMEOUT_MS:-1000}
+      APP_REQUEST_DEADLINE_MS: ${APP_REQUEST_DEADLINE_MS:-8000}
+      APP_PASSIVE_DEADLINE_MS: ${APP_PASSIVE_DEADLINE_MS:-1500}
+      # Passive mode, hazards, intents, history
+      APP_PASSIVE_NOTICES: ${APP_PASSIVE_NOTICES:-false}
+      APP_HAZARD_COOLDOWN_MS: ${APP_HAZARD_COOLDOWN_MS:-10000}
+      APP_HISTORY_SCENES: ${APP_HISTORY_SCENES:-5}
+      APP_HISTORY_TURNS: ${APP_HISTORY_TURNS:-6}
+      APP_HISTORY_TTL_S: ${APP_HISTORY_TTL_S:-600}
+      # Application parameters sent in welcome
+      APP_IMAGE_MAX_SIDE: ${APP_IMAGE_MAX_SIDE:-640}
+      APP_JPEG_QUALITY: ${APP_JPEG_QUALITY:-80}
+      APP_PASSIVE_INTERVAL_MS: ${APP_PASSIVE_INTERVAL_MS:-3000}
+      APP_LISTEN_WINDOW_MS: ${APP_LISTEN_WINDOW_MS:-5000}
+      APP_MAX_QUESTION_MS: ${APP_MAX_QUESTION_MS:-15000}
+      APP_AUDIO_OUT_SAMPLE_RATE: ${APP_AUDIO_OUT_SAMPLE_RATE:-24000}
+      APP_MAX_IMAGE_BYTES: ${APP_MAX_IMAGE_BYTES:-2097152}
+      # Journal and configuration snapshot
+      APP_POSTGRES_DSN: postgres://alv:${POSTGRES_PASSWORD:-}@postgres:5432/alv?sslmode=disable
+      APP_JOURNAL_BUFFER: ${APP_JOURNAL_BUFFER:-1024}
+      APP_CONFIG_REFRESH_S: ${APP_CONFIG_REFRESH_S:-60}
+    # Not published: Caddy reaches the gateway inside alv-net
+
+  postgres:
+    image: postgres:17.11-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: alv
+      POSTGRES_USER: alv
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    # Not published: only the gateway inside alv-net uses the journal
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "alv", "-d", "alv"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  gpt2giga:
+    image: ghcr.io/ai-forever/gpt2giga:0.3.0
+    profiles: ["gigachat"]
+    restart: unless-stopped
+    environment:
+      GPT2GIGA_HOST: 0.0.0.0
+      GPT2GIGA_PORT: "8090"
+      GIGACHAT_CREDENTIALS: ${GIGACHAT_CREDENTIALS:-}
+      GIGACHAT_SCOPE: ${GIGACHAT_SCOPE:-GIGACHAT_API_PERS}
+      GIGACHAT_MODEL: ${GIGACHAT_MODEL:-GigaChat-2}
+      # TLS to GigaChat is always verified against the NUC root; not taken from .env
+      GIGACHAT_VERIFY_SSL_CERTS: "True"
+      GIGACHAT_CA_BUNDLE_FILE: /certs/russian_trusted_root_ca.pem
+      GPT2GIGA_MODE: PROD
+      GPT2GIGA_ENABLE_API_KEY_AUTH: "True"
+      # With GigaChat the gateway key is the proxy key
+      GPT2GIGA_API_KEY: ${APP_LLM_API_KEY:-}
+      # The proxy keeps no requests and images
+      GPT2GIGA_TRAFFIC_LOG_ENABLED: "False"
+      GPT2GIGA_LOG_LEVEL: INFO
+    volumes:
+      - ./certs/russian_trusted_root_ca.pem:/certs/russian_trusted_root_ca.pem:ro
+    # Debug and live check only; the gateway uses http://gpt2giga:8090/v1
+    ports:
+      - "127.0.0.1:8104:8090"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  caddy-data:
+  caddy-config:
+  postgres-data:
+
+# Compose creates the network itself: no manual `docker network create`
+networks:
+  default:
+    name: alv-net
