@@ -20,12 +20,19 @@ func TestNewServer(t *testing.T) {
 		server   *Server
 		response *httptest.ResponseRecorder
 		getLogs  func() string
+		sessions http.Handler
+		upgrades int
 	)
 
 	setup := func() {
 		getLogs = logger.InitTestLogger()
+		upgrades = 0
+		sessions = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			upgrades++
+			w.WriteHeader(http.StatusSwitchingProtocols)
+		})
 		vars = &env.Vars{AppServerPort: 80, AppServerReadTimeout: 15, AppServerWriteTimeout: 15, AppServerIdleTimeout: 60, AppServerShutdownTimeout: 5}
-		server = NewServer(vars)
+		server = NewServer(vars, sessions)
 		response = httptest.NewRecorder()
 	}
 
@@ -36,6 +43,24 @@ func TestNewServer(t *testing.T) {
 
 		require.Equal(t, http.StatusOK, response.Code)
 		require.Equal(t, "OK", response.Body.String())
+	})
+
+	t.Run("must_register_session_route", func(t *testing.T) {
+		setup()
+
+		server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/session", nil))
+
+		require.Equal(t, http.StatusSwitchingProtocols, response.Code)
+		require.Equal(t, 1, upgrades)
+	})
+
+	t.Run("must_fail_session_wrong_method", func(t *testing.T) {
+		setup()
+
+		server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/session", nil))
+
+		require.Equal(t, http.StatusMethodNotAllowed, response.Code)
+		require.Zero(t, upgrades)
 	})
 
 	t.Run("must_pass_server_settings", func(t *testing.T) {
@@ -69,7 +94,7 @@ func TestNewServer(t *testing.T) {
 		require.NoError(t, err)
 		vars.AppServerPort = listener.Addr().(*net.TCPAddr).Port
 		require.NoError(t, listener.Close())
-		server = NewServer(vars)
+		server = NewServer(vars, sessions)
 		done := make(chan error, 1)
 
 		go func() {
@@ -96,7 +121,7 @@ func TestNewServer(t *testing.T) {
 		require.NoError(t, err)
 		defer listener.Close()
 		vars.AppServerPort = listener.Addr().(*net.TCPAddr).Port
-		server = NewServer(vars)
+		server = NewServer(vars, sessions)
 
 		err = server.Run()
 

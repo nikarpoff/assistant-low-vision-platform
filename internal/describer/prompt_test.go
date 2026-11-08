@@ -222,6 +222,7 @@ func TestPrompt(t *testing.T) {
 		require.Equal(t, testLLMModel, body["model"])
 		require.Equal(t, true, body["stream"])
 		require.Equal(t, 0.0, body["temperature"])
+		require.Equal(t, 1.0, body["top_p"])
 		require.Equal(t, 42.0, body["seed"])
 		require.Equal(t, 96.0, body["max_tokens"])
 		require.Equal(t, map[string]any{"enabled": false}, body["reasoning"])

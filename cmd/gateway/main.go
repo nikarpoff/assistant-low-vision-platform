@@ -1,11 +1,12 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/signal"
 	"syscall"
 
-	"github.com/nikarpoff/assistant-low-vision-platform/endpoints/httpserver"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/app"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/env"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/logger"
 )
@@ -32,14 +33,22 @@ func run() int {
 	logger.Info("Configuration loaded: server_port=%d describer_mode=%s placement=%s auth_disabled=%t log_level=%s",
 		vars.AppServerPort, vars.AppDescriberMode, vars.AppPlacement, vars.AppAuthDisabled, vars.LogLevel)
 
-	// HTTP server
-	srv := httpserver.NewServer(vars)
+	// Gateway
+	gateway, err := app.NewApp(vars)
+	if err != nil {
+		logger.Error(err)
+		return 1
+	}
+	if err := gateway.Start(context.Background()); err != nil {
+		logger.Error(err)
+		return 1
+	}
 	go func() {
-		if err := srv.Run(); err != nil {
+		if err := gateway.Run(); err != nil {
 			stopAppChan <- syscall.SIGQUIT
 		}
 	}()
-	defer srv.Stop()
+	defer gateway.Stop()
 
 	// Wait for exit signal
 	sig := <-stopAppChan

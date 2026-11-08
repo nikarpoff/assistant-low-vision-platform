@@ -62,11 +62,15 @@ const (
 	fieldStream      = "stream"
 	fieldTemperature = "temperature"
 	fieldSeed        = "seed"
+	fieldTopP        = "top_p"
 	fieldMaxTokens   = "max_tokens"
 	fieldUser        = "user"
 )
 
-var reservedFields = []string{fieldModel, fieldMessages, fieldStream, fieldTemperature, fieldSeed, fieldMaxTokens, fieldUser}
+var reservedFields = []string{fieldModel, fieldMessages, fieldStream, fieldTemperature, fieldTopP, fieldSeed, fieldMaxTokens, fieldUser}
+
+// TopP is the top_p generation parameter sent in every request: DSC-5 fixes it at 1.
+const TopP = 1.0
 
 // Connection pool settings: keep-alive connections to the provider (PLT-15).
 const (
@@ -303,6 +307,7 @@ func (c *Client) requestBody(req *Request) ([]byte, error) {
 	body[fieldMessages] = req.Messages
 	body[fieldStream] = true
 	body[fieldTemperature] = c.temperature
+	body[fieldTopP] = TopP
 	body[fieldSeed] = c.seed
 	body[fieldMaxTokens] = c.maxTokens
 

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/env"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/llm"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/logger"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/upstream"
 )
@@ -88,6 +89,7 @@ func NewCollector(vars *env.Vars, hashes Hashes, sources Sources) (*Collector, e
 		},
 		Generation: Generation{
 			Temperature: vars.AppLLMTemperature,
+			TopP:        llm.TopP,
 			Seed:        vars.AppLLMSeed,
 			MaxTokens:   vars.AppLLMMaxTokens,
 			ExtraBody:   extraBody,
