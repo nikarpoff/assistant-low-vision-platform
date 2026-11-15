@@ -103,6 +103,8 @@ type Config struct {
 	DeviceTokens []string
 	// ServerVersion goes to welcome.
 	ServerVersion string
+	// DescriberMode is APP_DESCRIBER_MODE: the mode of the journal records the session writes itself.
+	DescriberMode string
 	// Client is the config of welcome (PROTO-13).
 	Client protocol.ClientConfig
 	// Limits are the payload limits of the frames (PROTO-3).
@@ -122,6 +124,7 @@ func NewConfig(vars *env.Vars, serverVersion string) Config {
 		AuthDisabled:  vars.AppAuthDisabled,
 		DeviceTokens:  vars.AppDeviceTokens,
 		ServerVersion: serverVersion,
+		DescriberMode: string(vars.AppDescriberMode),
 		Client: protocol.ClientConfig{
 			ImageMaxSide:      vars.AppImageMaxSide,
 			JPEGQuality:       vars.AppJPEGQuality,

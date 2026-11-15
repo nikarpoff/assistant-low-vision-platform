@@ -391,8 +391,29 @@ func (s *Session) onPassive(m *protocol.Describe) {
 	if busy {
 		s.ignored[m.RequestID] = true
 		s.server.metrics.Requests.WithLabelValues(pipeline.KindPassive, pipeline.StatusSkipped).Inc()
+		s.recordSkipped(m.RequestID)
 		s.send(nil, &protocol.PassiveClear{RequestID: m.RequestID, Reason: protocol.ClearSkipped})
+		logger.Info("passive request cleared: request_id=%s reason=%s", m.RequestID, protocol.ClearSkipped)
 	}
+}
+
+// recordSkipped gives a passive request skipped by the session to the journal, like the
+// pipeline does for every outcome of the passive mode (PLT-11). The snapshot has not
+// come yet, so its size is 0.
+func (s *Session) recordSkipped(id uuid.UUID) {
+	configID := ""
+	if current := s.server.config.Current(); current != nil {
+		configID = current.ConfigID
+	}
+	s.server.recorder.Write(&journal.Request{
+		RequestID:     id.String(),
+		SessionID:     s.id.String(),
+		Kind:          pipeline.KindPassive,
+		DescriberMode: s.server.cfg.DescriberMode,
+		Status:        pipeline.StatusSkipped,
+		ConfigID:      configID,
+		CreatedAt:     time.Now().UTC(),
+	})
 }
 
 // onAskStart starts a question right away: the pipeline gets the snapshot as soon as it
@@ -591,28 +612,29 @@ func (s *Session) start(r *request, run func(ctx context.Context, sink pipeline.
 
 		run(r.ctx, &sink{session: s, request: r})
 
-		s.mu.Lock()
-		if s.user == r {
-			s.user = nil
-		}
-		if s.passive == r {
-			s.passive = nil
-		}
-		s.mu.Unlock()
+		// Usually released already by the last message of the request (sink.Send)
+		s.release(r)
 		r.cancel(errRequestDone)
 	}()
 }
 
-// reject ends the request with an error before or instead of its pipeline.
-func (s *Session) reject(r *request, err error) {
+// release frees the slot of the request, so the next request of the application is not
+// skipped or cancelled because of it. A slot taken by another request is left alone.
+func (s *Session) release(r *request) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.user == r {
 		s.user = nil
 	}
 	if s.passive == r {
 		s.passive = nil
 	}
-	s.mu.Unlock()
+}
+
+// reject ends the request with an error before or instead of its pipeline.
+func (s *Session) reject(r *request, err error) {
+	s.release(r)
 
 	running := r.running
 	r.cancel(pipeline.ErrRejected)
@@ -676,9 +698,24 @@ type sink struct {
 	request *request
 }
 
-// Send queues a message of the request.
+// Send queues a message of the request. Before the last message of the request -
+// answer.end, passive.clear or error - the slot of the request is freed: the application
+// may send the next request as soon as it gets the last message, and it must find the
+// slot free (PROTO-8).
 func (k *sink) Send(message protocol.Message) {
+	if isLast(message) {
+		k.session.release(k.request)
+	}
 	k.session.send(k.request, message)
+}
+
+// isLast reports whether the message ends a request.
+func isLast(message protocol.Message) bool {
+	switch message.(type) {
+	case *protocol.AnswerEnd, *protocol.PassiveClear, *protocol.ErrorMessage:
+		return true
+	}
+	return false
 }
 
 // SendAudio queues an AUDIO_OUT frame of the request.
