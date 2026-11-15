@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -161,10 +162,24 @@ func (s *Session) run() {
 	}
 	s.user, s.passive = nil, nil
 	s.mu.Unlock()
+	s.waitRequests()
 	if s.hello != nil {
 		s.server.recorder.Write(&journal.SessionEnd{SessionID: s.id.String(), EndedAt: time.Now().UTC()})
 	}
 	logger.Info("Session closed: session_id=%s", s.id)
+}
+
+// waitRequests waits until the cancelled pipelines of the session return, at most
+// drainTimeout: their journal records come before the end of the session and before
+// the journal is stopped on shutdown (PLT-11).
+func (s *Session) waitRequests() {
+	deadline := time.Now().Add(drainTimeout)
+	for s.active.Load() > 0 && time.Now().Before(deadline) {
+		time.Sleep(shutdownPoll)
+	}
+	if active := s.active.Load(); active > 0 {
+		logger.Warning("session closed with requests still running: session_id=%s requests=%d", s.id, active)
+	}
 }
 
 // close ends the session: stops the writer and the pings, cancels the requests and closes the connection.
@@ -391,16 +406,17 @@ func (s *Session) onPassive(m *protocol.Describe) {
 	if busy {
 		s.ignored[m.RequestID] = true
 		s.server.metrics.Requests.WithLabelValues(pipeline.KindPassive, pipeline.StatusSkipped).Inc()
-		s.recordSkipped(m.RequestID)
+		s.record(m.RequestID, pipeline.KindPassive, time.Now(), pipeline.StatusSkipped, "")
 		s.send(nil, &protocol.PassiveClear{RequestID: m.RequestID, Reason: protocol.ClearSkipped})
 		logger.Info("passive request cleared: request_id=%s reason=%s", m.RequestID, protocol.ClearSkipped)
 	}
 }
 
-// recordSkipped gives a passive request skipped by the session to the journal, like the
-// pipeline does for every outcome of the passive mode (PLT-11). The snapshot has not
-// come yet, so its size is 0.
-func (s *Session) recordSkipped(id uuid.UUID) {
+// record gives the journal a request that ends in the session without its pipeline:
+// a passive request skipped, a request rejected or cancelled before its pipeline starts.
+// Every request is in the journal (PLT-11); a request with a pipeline is recorded by it.
+// The snapshot has not been taken, so its size is 0.
+func (s *Session) record(id uuid.UUID, kind string, createdAt time.Time, status string, code protocol.ErrorCode) {
 	configID := ""
 	if current := s.server.config.Current(); current != nil {
 		configID = current.ConfigID
@@ -408,11 +424,12 @@ func (s *Session) recordSkipped(id uuid.UUID) {
 	s.server.recorder.Write(&journal.Request{
 		RequestID:     id.String(),
 		SessionID:     s.id.String(),
-		Kind:          pipeline.KindPassive,
+		Kind:          kind,
 		DescriberMode: s.server.cfg.DescriberMode,
-		Status:        pipeline.StatusSkipped,
+		Status:        status,
+		ErrorCode:     string(code),
 		ConfigID:      configID,
-		CreatedAt:     time.Now().UTC(),
+		CreatedAt:     createdAt.UTC(),
 	})
 }
 
@@ -637,9 +654,11 @@ func (s *Session) reject(r *request, err error) {
 	s.release(r)
 
 	running := r.running
-	r.cancel(pipeline.ErrRejected)
+	// The pipeline takes the error code of the journal from the cause
+	r.cancel(fmt.Errorf("%w: %w", pipeline.ErrRejected, err))
 	if !running {
 		s.server.metrics.Requests.WithLabelValues(r.kind, pipeline.StatusError).Inc()
+		s.record(r.id, r.kind, r.startedAt, pipeline.StatusError, protocol.CodeOf(err))
 	}
 	s.sendError(&r.id, err)
 }
@@ -653,7 +672,7 @@ func (s *Session) cancelUser() {
 }
 
 // drop ends the request with the cause. A request whose pipeline is not running yet is
-// counted here; a running pipeline counts itself.
+// counted and recorded here; a running pipeline counts and records itself.
 func (s *Session) drop(r *request, cause error) {
 	if r.ctx.Err() != nil {
 		return
@@ -661,6 +680,7 @@ func (s *Session) drop(r *request, cause error) {
 	r.cancel(cause)
 	if !r.running {
 		s.server.metrics.Requests.WithLabelValues(r.kind, pipeline.StatusCancelled).Inc()
+		s.record(r.id, r.kind, r.startedAt, pipeline.StatusCancelled, "")
 	}
 	if errors.Is(cause, pipeline.ErrCancelled) {
 		logger.Info("request cancelled by the application: session_id=%s request_id=%s kind=%s", s.id, r.id, r.kind)

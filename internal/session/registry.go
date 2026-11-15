@@ -18,6 +18,10 @@ const msgGoingAway = "server is going away"
 // shutdownPoll is how often Shutdown checks whether the active requests are over.
 const shutdownPoll = 10 * time.Millisecond
 
+// drainTimeout is how long a closed session waits for its cancelled pipelines and the
+// shutdown waits for the closed sessions to record their ends.
+const drainTimeout = 2 * time.Second
+
 // Registry keeps the open sessions and alv_sessions_active (PLT-1).
 type Registry struct {
 	active prometheus.Gauge
@@ -114,6 +118,13 @@ wait:
 		}()
 	}
 	wg.Wait()
+
+	// The sessions record their cancelled requests and their ends after the close:
+	// the journal is stopped after Shutdown, so their records are waited for
+	deadline := time.Now().Add(2 * drainTimeout)
+	for r.Len() > 0 && time.Now().Before(deadline) {
+		time.Sleep(shutdownPoll)
+	}
 	logger.Info("sessions closed: sessions=%d", len(sessions))
 }
 
