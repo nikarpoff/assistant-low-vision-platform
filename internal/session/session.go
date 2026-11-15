@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -161,10 +162,24 @@ func (s *Session) run() {
 	}
 	s.user, s.passive = nil, nil
 	s.mu.Unlock()
+	s.waitRequests()
 	if s.hello != nil {
 		s.server.recorder.Write(&journal.SessionEnd{SessionID: s.id.String(), EndedAt: time.Now().UTC()})
 	}
 	logger.Info("Session closed: session_id=%s", s.id)
+}
+
+// waitRequests waits until the cancelled pipelines of the session return, at most
+// drainTimeout: their journal records come before the end of the session and before
+// the journal is stopped on shutdown (PLT-11).
+func (s *Session) waitRequests() {
+	deadline := time.Now().Add(drainTimeout)
+	for s.active.Load() > 0 && time.Now().Before(deadline) {
+		time.Sleep(shutdownPoll)
+	}
+	if active := s.active.Load(); active > 0 {
+		logger.Warning("session closed with requests still running: session_id=%s requests=%d", s.id, active)
+	}
 }
 
 // close ends the session: stops the writer and the pings, cancels the requests and closes the connection.
@@ -391,8 +406,31 @@ func (s *Session) onPassive(m *protocol.Describe) {
 	if busy {
 		s.ignored[m.RequestID] = true
 		s.server.metrics.Requests.WithLabelValues(pipeline.KindPassive, pipeline.StatusSkipped).Inc()
+		s.record(m.RequestID, pipeline.KindPassive, time.Now(), pipeline.StatusSkipped, "")
 		s.send(nil, &protocol.PassiveClear{RequestID: m.RequestID, Reason: protocol.ClearSkipped})
+		logger.Info("passive request cleared: request_id=%s reason=%s", m.RequestID, protocol.ClearSkipped)
 	}
+}
+
+// record gives the journal a request that ends in the session without its pipeline:
+// a passive request skipped, a request rejected or cancelled before its pipeline starts.
+// Every request is in the journal (PLT-11); a request with a pipeline is recorded by it.
+// The snapshot has not been taken, so its size is 0.
+func (s *Session) record(id uuid.UUID, kind string, createdAt time.Time, status string, code protocol.ErrorCode) {
+	configID := ""
+	if current := s.server.config.Current(); current != nil {
+		configID = current.ConfigID
+	}
+	s.server.recorder.Write(&journal.Request{
+		RequestID:     id.String(),
+		SessionID:     s.id.String(),
+		Kind:          kind,
+		DescriberMode: s.server.cfg.DescriberMode,
+		Status:        status,
+		ErrorCode:     string(code),
+		ConfigID:      configID,
+		CreatedAt:     createdAt.UTC(),
+	})
 }
 
 // onAskStart starts a question right away: the pipeline gets the snapshot as soon as it
@@ -591,33 +629,36 @@ func (s *Session) start(r *request, run func(ctx context.Context, sink pipeline.
 
 		run(r.ctx, &sink{session: s, request: r})
 
-		s.mu.Lock()
-		if s.user == r {
-			s.user = nil
-		}
-		if s.passive == r {
-			s.passive = nil
-		}
-		s.mu.Unlock()
+		// Usually released already by the last message of the request (sink.Send)
+		s.release(r)
 		r.cancel(errRequestDone)
 	}()
 }
 
-// reject ends the request with an error before or instead of its pipeline.
-func (s *Session) reject(r *request, err error) {
+// release frees the slot of the request, so the next request of the application is not
+// skipped or cancelled because of it. A slot taken by another request is left alone.
+func (s *Session) release(r *request) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.user == r {
 		s.user = nil
 	}
 	if s.passive == r {
 		s.passive = nil
 	}
-	s.mu.Unlock()
+}
+
+// reject ends the request with an error before or instead of its pipeline.
+func (s *Session) reject(r *request, err error) {
+	s.release(r)
 
 	running := r.running
-	r.cancel(pipeline.ErrRejected)
+	// The pipeline takes the error code of the journal from the cause
+	r.cancel(fmt.Errorf("%w: %w", pipeline.ErrRejected, err))
 	if !running {
 		s.server.metrics.Requests.WithLabelValues(r.kind, pipeline.StatusError).Inc()
+		s.record(r.id, r.kind, r.startedAt, pipeline.StatusError, protocol.CodeOf(err))
 	}
 	s.sendError(&r.id, err)
 }
@@ -631,7 +672,7 @@ func (s *Session) cancelUser() {
 }
 
 // drop ends the request with the cause. A request whose pipeline is not running yet is
-// counted here; a running pipeline counts itself.
+// counted and recorded here; a running pipeline counts and records itself.
 func (s *Session) drop(r *request, cause error) {
 	if r.ctx.Err() != nil {
 		return
@@ -639,6 +680,7 @@ func (s *Session) drop(r *request, cause error) {
 	r.cancel(cause)
 	if !r.running {
 		s.server.metrics.Requests.WithLabelValues(r.kind, pipeline.StatusCancelled).Inc()
+		s.record(r.id, r.kind, r.startedAt, pipeline.StatusCancelled, "")
 	}
 	if errors.Is(cause, pipeline.ErrCancelled) {
 		logger.Info("request cancelled by the application: session_id=%s request_id=%s kind=%s", s.id, r.id, r.kind)
@@ -676,9 +718,24 @@ type sink struct {
 	request *request
 }
 
-// Send queues a message of the request.
+// Send queues a message of the request. Before the last message of the request -
+// answer.end, passive.clear or error - the slot of the request is freed: the application
+// may send the next request as soon as it gets the last message, and it must find the
+// slot free (PROTO-8).
 func (k *sink) Send(message protocol.Message) {
+	if isLast(message) {
+		k.session.release(k.request)
+	}
 	k.session.send(k.request, message)
+}
+
+// isLast reports whether the message ends a request.
+func isLast(message protocol.Message) bool {
+	switch message.(type) {
+	case *protocol.AnswerEnd, *protocol.PassiveClear, *protocol.ErrorMessage:
+		return true
+	}
+	return false
 }
 
 // SendAudio queues an AUDIO_OUT frame of the request.

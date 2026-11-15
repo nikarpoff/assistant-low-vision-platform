@@ -53,7 +53,8 @@ const (
 	upstreamLabel          = "llm"
 	finishReasonError      = "error"
 	maxErrorBodyBytes      = 64 << 10
-	maxModelsBodyBytes     = 4 << 20 // the list of a provider with hundreds of models
+	maxModelsBodyBytes     = 4 << 20  // the list of a provider with hundreds of models
+	maxDrainBytes          = 64 << 10 // the rest of a finished stream after [DONE]
 )
 
 // Body fields the client sets itself. APP_LLM_EXTRA_BODY must not set them, nor
@@ -392,6 +393,7 @@ func (s *stream) run(ctx context.Context, httpClient *http.Client, httpRequest *
 		case err != nil:
 			return contextFailure(ctx, response.StatusCode, err)
 		case done:
+			drain(response.Body)
 			return s.checkEmpty(response.StatusCode)
 		}
 
@@ -400,6 +402,15 @@ func (s *stream) run(ctx context.Context, httpClient *http.Client, httpRequest *
 			return err
 		}
 	}
+}
+
+// drain reads the rest of a finished stream after [DONE] - at least the end of the
+// chunked body - so the connection goes back to the pool: the transport reuses it only
+// when the body is read to the end before it is closed. A stopped or failed stream is
+// not drained, closing it ends the generation. The read is bounded by maxDrainBytes and
+// by the deadline of the request.
+func drain(body io.Reader) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxDrainBytes))
 }
 
 // handleChunk takes model, fingerprint, usage, errors and text from one chunk.

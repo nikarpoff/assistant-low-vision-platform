@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -46,7 +47,9 @@ func (p *Pipeline) Passive(ctx context.Context, req *PassiveRequest, sink Sink) 
 		p.finish(r)
 		return
 	}
+	release = sync.OnceFunc(release)
 	defer release()
+	r.release = release
 	r.staleAt = req.ReceivedAt.Add(p.cfg.PassiveDeadline)
 	if !time.Now().Before(r.staleAt) {
 		p.clear(r, protocol.ClearStale)
@@ -160,7 +163,7 @@ func (p *Pipeline) clear(r *run, reason protocol.ClearReason) {
 	if r.cancelled() || r.rejected() {
 		return
 	}
-	r.sink.Send(&protocol.PassiveClear{RequestID: r.uuid, Reason: reason})
+	r.sendLast(&protocol.PassiveClear{RequestID: r.uuid, Reason: reason})
 	logger.Info("passive request cleared: request_id=%s reason=%s", r.id, reason)
 }
 

@@ -34,6 +34,7 @@
 | `reference.env` | обе машины эталонного стенда | несекретные значения эталонной конфигурации |
 | `fetch-weights.sh` | машина моделей | загрузка весов моделей в тома |
 | `llm-live-check.sh` | VM или машина разработки | живая проверка Polza.ai и GigaChat настоящими ключами |
+| `e2e-smoke.sh` | любая машина с Docker | сквозная проверка всей цепочки на `compose.fake.yml` |
 
 Имена сервисов во всех файлах: `caddy`, `gateway`, `postgres`, `gpt2giga`, `detector`, `asr`, `tts`, `fakellm`. Сеть Docker - `alv-net`, compose создаёт её сам. У каждого сервиса `restart: unless-stopped`; healthcheck `gateway` и `fakellm` (образ distroless без curl) - `/gateway -healthcheck` и `/fakellm -healthcheck`. Шлюз стартует независимо от сервисов ИИ-моделей, а его готовность показывает `/ready`.
 
@@ -319,6 +320,42 @@ docker compose --env-file .env.example -f compose.fake.yml -f compose.local-buil
 
 Шлюз требует токены устройства и админа: задайте их в окружении (`APP_DEVICE_TOKENS=... APP_ADMIN_TOKEN=... docker compose ...`) или `APP_AUTH_DISABLED=true`. Остановка - `docker compose -f compose.fake.yml -p alv-fake down -v`.
 
+### Лёгкие образы сервисов: `EXTRAS=""`
+
+`compose.local-build.yml` собирает детектор, ASR и TTS с build-аргументом `EXTRAS=""`. В `Dockerfile.cpu` сервисов `EXTRAS` по умолчанию `cpu`: профиль с torch и настоящими бэкендами, около 1,8 ГБ на образ. Стенду на заглушках они не нужны - все три сервиса работают на бэкенде `fake`, который не загружает веса и не импортирует torch. С пустым `EXTRAS` ставятся только общие зависимости, поэтому:
+
+- три образа занимают сотни мегабайт, а не 5-6 ГБ, и помещаются на машину разработки или раннер CI;
+- холодная сборка всех пяти образов укладывается в предел 900 секунд на критерий; повторная берёт слои из кэша Docker;
+- настоящий бэкенд в таком образе не запускается: для замеров нужны образы `-cpu` или `-cuda` из реестра (`compose.models.yml`, `compose.single.yml`).
+
+### Сквозная проверка `e2e-smoke.sh`
+
+Скрипт проверяет всю цепочку на заглушках (DEP-8). Запуск - из каталога репозитория Шлюза:
+
+```bash
+./deployments/e2e-smoke.sh                    # образы из реестра, тег ALV_IMAGE_TAG (по умолчанию latest)
+ALV_LOCAL_BUILD=1 ./deployments/e2e-smoke.sh  # образы из исходников общего проекта
+# ...
+# e2e: ok
+```
+
+С `ALV_LOCAL_BUILD=1` скрипт добавляет `compose.local-build.yml` и собирает образы: Шлюз и `fakellm` - из этого репозитория, сервисы - из соседних каталогов `../objects-detector`, `../asr-service`, `../tts-service`. Если репозиторий Шлюза лежит отдельно от остальных (например, в git worktree), рядом с ним должны быть эти каталоги или символические ссылки на них. Нужны Docker с compose, `curl` и `jq`; ключи поставщиков, видеокарта и выход в интернет (кроме реестров образов) не нужны.
+
+Что делает скрипт:
+
+1. Поднимает `compose.fake.yml` отдельным проектом `alv-e2e` и ждёт `200` от `/ready` не дольше `ALV_E2E_READY_TIMEOUT_S` секунд (по умолчанию 300). Настройки берутся только из значений по умолчанию файлов compose (`--env-file /dev/null`), `deployments/.env` не читается. Токены устройства и админа - случайные на каждый прогон.
+2. Запускает `loadgen --strict` из образа Шлюза в сети `alv-net` по встроенному мини-набору `testdata/minidataset` (5 снимков, 2 вопроса): сценарии `describe`, `ask` и `passive`, по одному прогону в режимах описания `template` и `llm` (на `fakellm`). Между режимами Шлюз пересоздаётся с другим `APP_DESCRIBER_MODE`.
+3. Проверяет:
+   - `loadgen --strict` завершился с кодом 0, в JSONL есть запросы всех трёх видов, ни одного со статусом `error` или кодом ошибки;
+   - у каждого ответа (`ok` или `degraded`) есть аудио (`audio_bytes > 0`) и непустые `timings`;
+   - каждый запрос прогона есть в таблице `request` журнала с нужным `describer_mode` и без статуса `error` (`psql` в контейнере `postgres`); в режиме `llm` есть ответы с `llm_model = fake/fake-llm`;
+   - `/v1/stats` с админ-токеном отдаёт `p95` этапов `detect_ms`, `asr_ms`, `llm_ttft_ms`, `tts_first_chunk_ms`, `server_total_ms`.
+4. Печатает `e2e: ok`.
+
+При любом исходе `trap` останавливает стенд и удаляет его контейнеры и тома (`down -v`), поэтому прогоны можно повторять подряд; остатки прерванного прогона убираются в начале следующего. Образы остаются как кэш. При ошибке скрипт печатает `e2e: failed: <причина>`, состояние контейнеров и последние строки их логов и завершается с кодом 1. Стенд занимает порт `127.0.0.1:8080` и сеть `alv-net`, поэтому одновременно с другим стендом на той же машине не запускается.
+
+В GitHub Actions проверку запускает `.github/workflows/e2e.yml`: он раскладывает репозитории как в общем проекте и вызывает `ALV_LOCAL_BUILD=1 ./deployments/e2e-smoke.sh`. Для закрытых репозиториев сервисов нужен секрет `ALV_REPOS_TOKEN` с правом чтения.
+
 ## Типичные неполадки
 
 | Признак | Причина и решение |
@@ -336,4 +373,6 @@ docker compose --env-file .env.example -f compose.fake.yml -f compose.local-buil
 | `llm` в `/ready` - `down` или `insufficient_balance` в `llm_error` журнала | у поставщика кончились средства или лимит расходов |
 | Сервис долго стартует или падает с ошибкой загрузки весов | веса не скачаны: `./fetch-weights.sh`; на машине без сети - скачать заранее |
 | `could not select device driver "nvidia"` | на машине моделей не установлен NVIDIA Container Toolkit |
+| `e2e: failed: /ready is not 200` | сервис не поднялся: в выводе - ответ `/ready`, `ps` и логи; при медленной холодной сборке или старте увеличьте `ALV_E2E_READY_TIMEOUT_S` |
+| `network alv-net ... exists` или `port is already allocated` при `e2e-smoke.sh` | запущен другой стенд: остановите его (`docker compose ... down`) |
 | `port is already allocated` для 8080 или 8104 | порт занят другим стендом или gpt2giga: остановите его (`docker compose ... down`) |

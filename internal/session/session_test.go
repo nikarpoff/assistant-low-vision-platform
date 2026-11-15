@@ -48,11 +48,6 @@ const (
 // testImage is a small fake JPEG snapshot.
 var testImage = []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0x00, 0xFF, 0xD9}
 
-// discardRecorder drops the journal records.
-type discardRecorder struct{}
-
-func (discardRecorder) Write(journal.Record) {}
-
 // harness is a session server over a real pipeline in the template mode and the service stubs.
 type harness struct {
 	server   *Server
@@ -110,13 +105,15 @@ func newHarness(t *testing.T, mutate func(cfg *Config)) *harness {
 		return &snapshot.Snapshot{ConfigID: testConfigID}
 	}}
 
+	// The session and the pipelines write to one journal, as in the gateway
+	h.recorder = &RecorderMock{WriteFunc: func(journal.Record) {}}
 	pipelines := pipeline.NewPipeline(pipeline.NewConfig(vars), pipeline.Dependencies{
 		Detector:    detectorClient,
 		Synthesizer: ttsClient,
 		Describer:   sceneDescriber,
 		History:     store,
 		Policy:      policy,
-		Recorder:    discardRecorder{},
+		Recorder:    h.recorder,
 		Config:      configSource,
 		Metrics:     h.metrics,
 	})
@@ -125,7 +122,6 @@ func newHarness(t *testing.T, mutate func(cfg *Config)) *harness {
 	if mutate != nil {
 		mutate(&h.cfg)
 	}
-	h.recorder = &RecorderMock{WriteFunc: func(journal.Record) {}}
 	h.server = NewServer(h.cfg, pipelines, configSource, h.recorder, h.metrics)
 	h.http = httptest.NewServer(h.server)
 	t.Cleanup(h.http.Close)
@@ -816,5 +812,261 @@ alv_e2e_duration_seconds_count{kind="describe",network="wifi"} 1
 		require.Len(t, s.kinds, recentKinds)
 		require.Len(t, s.kindOrder, recentKinds)
 		require.NotContains(t, s.kinds, first)
+	})
+}
+
+func TestSession_PassiveJournal(t *testing.T) {
+	var (
+		h *harness
+	)
+
+	setup := func() {
+		logger.InitTestLogger()
+		h = newHarness(t, nil)
+	}
+
+	// passive sends a passive describe and its snapshot.
+	passive := func(t *testing.T, c *client, id uuid.UUID) {
+		t.Helper()
+		c.send(t, fmt.Sprintf(`{"type":"describe","request_id":"%s","mode":"passive","focus":"ahead","image":{"width":640,"height":480,"bytes":%d}}`, id, len(testImage)))
+		c.sendFrame(t, protocol.EncodeFrame(&protocol.Frame{Kind: protocol.KindImageJPEG, RequestID: id, Payload: testImage}))
+	}
+
+	// last reads until the last message of the passive request: passive.clear, answer.end or error.
+	last := func(t *testing.T, c *client, id uuid.UUID) protocol.Message {
+		t.Helper()
+		for {
+			switch m := c.next(t).message.(type) {
+			case *protocol.PassiveClear:
+				if m.RequestID == id {
+					return m
+				}
+			case *protocol.AnswerEnd:
+				if m.RequestID == id {
+					return m
+				}
+			case *protocol.ErrorMessage:
+				if m.RequestID != nil && *m.RequestID == id {
+					return m
+				}
+			}
+		}
+	}
+
+	t.Run("must_pass_skipped_journaled", func(t *testing.T) {
+		setup()
+		c := h.open(t)
+		// A question in progress: the passive request is skipped by the session
+		question := uuid.New()
+		c.send(t, fmt.Sprintf(`{"type":"ask.start","request_id":"%s","trigger":"hold","with_image":false}`, question))
+		id := uuid.New()
+		passive(t, c, id)
+
+		require.Equal(t, &protocol.PassiveClear{RequestID: id, Reason: protocol.ClearSkipped}, c.next(t).message)
+		var record *journal.Request
+		require.Eventually(t, func() bool {
+			for _, call := range h.recorder.WriteCalls() {
+				if r, ok := call.Record.(*journal.Request); ok && r.RequestID == id.String() {
+					record = r
+					return true
+				}
+			}
+			return false
+		}, testTimeout, 10*time.Millisecond)
+		require.Equal(t, pipeline.KindPassive, record.Kind)
+		require.Equal(t, pipeline.StatusSkipped, record.Status)
+		require.Equal(t, string(env.DescriberModeTemplate), record.DescriberMode)
+		require.Equal(t, testConfigID, record.ConfigID)
+		require.NotEmpty(t, record.SessionID)
+		require.Equal(t, time.UTC, record.CreatedAt.Location())
+		require.Equal(t, 1.0, testutil.ToFloat64(h.metrics.Requests.WithLabelValues(pipeline.KindPassive, pipeline.StatusSkipped)))
+	})
+
+	t.Run("must_pass_back_to_back_not_skipped", func(t *testing.T) {
+		setup()
+		c := h.open(t)
+		// The next passive request goes right after the last message of the previous one
+		for i := 0; i < 50; i++ {
+			id := uuid.New()
+			passive(t, c, id)
+			got := last(t, c, id)
+			if clear, ok := got.(*protocol.PassiveClear); ok {
+				require.NotEqual(t, protocol.ClearSkipped, clear.Reason, "request %d is skipped", i)
+			}
+			require.IsNotType(t, &protocol.ErrorMessage{}, got, "request %d failed", i)
+		}
+	})
+}
+
+func TestSession_RequestJournal(t *testing.T) {
+	var (
+		h *harness
+		c *client
+	)
+
+	setup := func() {
+		logger.InitTestLogger()
+		h = newHarness(t, nil)
+		c = h.open(t)
+	}
+
+	// request waits for the journal record of the request and returns it.
+	request := func(t *testing.T, id uuid.UUID) *journal.Request {
+		t.Helper()
+		var found *journal.Request
+		require.Eventually(t, func() bool {
+			for _, call := range h.recorder.WriteCalls() {
+				if r, ok := call.Record.(*journal.Request); ok && r.RequestID == id.String() {
+					found = r
+					return true
+				}
+			}
+			return false
+		}, testTimeout, 10*time.Millisecond)
+		return found
+	}
+
+	// requireRecord checks the record of a request that ended without an answer.
+	requireRecord := func(t *testing.T, id uuid.UUID, kind, status string, code protocol.ErrorCode) {
+		t.Helper()
+		record := request(t, id)
+		require.Equal(t, kind, record.Kind)
+		require.Equal(t, status, record.Status)
+		require.Equal(t, string(code), record.ErrorCode)
+		require.Equal(t, string(env.DescriberModeTemplate), record.DescriberMode)
+		require.Equal(t, testConfigID, record.ConfigID)
+		require.NotEmpty(t, record.SessionID)
+		require.Equal(t, time.UTC, record.CreatedAt.Location())
+		require.Zero(t, record.ImageBytes)
+	}
+
+	// describeWaiting sends describe without its snapshot: the request waits for it.
+	describeWaiting := func(t *testing.T, id uuid.UUID) {
+		t.Helper()
+		c.send(t, fmt.Sprintf(`{"type":"describe","request_id":"%s","mode":"on_demand","focus":"all","image":{"width":640,"height":480,"bytes":13}}`, id))
+	}
+
+	// count returns how many journal records the request has.
+	count := func(id uuid.UUID) int {
+		n := 0
+		for _, call := range h.recorder.WriteCalls() {
+			if r, ok := call.Record.(*journal.Request); ok && r.RequestID == id.String() {
+				n++
+			}
+		}
+		return n
+	}
+
+	t.Run("must_pass_rejected_journaled", func(t *testing.T) {
+		setup()
+
+		// The snapshot over the limit
+		tooLarge := uuid.New()
+		c.describe(t, tooLarge, make([]byte, testMaxImageBytes+1))
+		require.Equal(t, protocol.CodePayloadTooLarge, c.nextError(t).Code)
+		requireRecord(t, tooLarge, pipeline.KindDescribe, pipeline.StatusError, protocol.CodePayloadTooLarge)
+
+		// The question too long: its pipeline runs from ask.start and records it
+		tooLong := uuid.New()
+		c.send(t, fmt.Sprintf(`{"type":"ask.start","request_id":"%s","trigger":"hold","with_image":false}`, tooLong))
+		c.send(t, fmt.Sprintf(`{"type":"ask.end","request_id":"%s","audio_ms":15001}`, tooLong))
+		require.Equal(t, protocol.CodePayloadTooLarge, c.nextError(t).Code)
+		requireRecord(t, tooLong, pipeline.KindAsk, pipeline.StatusError, protocol.CodePayloadTooLarge)
+
+		// busy while the server shuts down
+		h.server.registry.mu.Lock()
+		h.server.registry.closing = true
+		h.server.registry.mu.Unlock()
+		busy := uuid.New()
+		c.describe(t, busy, testImage)
+		// accepted goes before the start of the pipeline, so it may come before the error
+		all := c.until(t, busy)
+		require.Equal(t, protocol.CodeBusy, all[len(all)-1].message.(*protocol.ErrorMessage).Code)
+		requireRecord(t, busy, pipeline.KindDescribe, pipeline.StatusError, protocol.CodeBusy)
+
+		for _, id := range []uuid.UUID{tooLarge, tooLong, busy} {
+			require.Equal(t, 1, count(id))
+		}
+	})
+
+	t.Run("must_pass_cancelled_journaled", func(t *testing.T) {
+		setup()
+
+		// cancel before the snapshot
+		cancelled := uuid.New()
+		describeWaiting(t, cancelled)
+		c.send(t, fmt.Sprintf(`{"type":"cancel","request_id":"%s"}`, cancelled))
+		requireRecord(t, cancelled, pipeline.KindDescribe, pipeline.StatusCancelled, "")
+
+		// A new user request replaces the one waiting for its snapshot
+		replaced := uuid.New()
+		describeWaiting(t, replaced)
+		c.describe(t, uuid.New(), testImage)
+		requireRecord(t, replaced, pipeline.KindDescribe, pipeline.StatusCancelled, "")
+
+		// A question cancelled before ask.end: its pipeline records it
+		question := uuid.New()
+		c.send(t, fmt.Sprintf(`{"type":"ask.start","request_id":"%s","trigger":"hold","with_image":false}`, question))
+		c.send(t, fmt.Sprintf(`{"type":"cancel","request_id":"%s"}`, question))
+		requireRecord(t, question, pipeline.KindAsk, pipeline.StatusCancelled, "")
+
+		// The session closes while a request waits for its snapshot and a question for ask.end
+		closedDescribe, closedAsk := uuid.New(), uuid.New()
+		describeWaiting(t, closedDescribe)
+		c.send(t, fmt.Sprintf(`{"type":"ask.start","request_id":"%s","trigger":"hold","with_image":false}`, closedAsk))
+		_ = c.next(t) // answer of the replacing request, so both messages are read by the session
+		require.NoError(t, c.conn.Close())
+		requireRecord(t, closedAsk, pipeline.KindAsk, pipeline.StatusCancelled, "")
+		requireRecord(t, closedDescribe, pipeline.KindDescribe, pipeline.StatusCancelled, "")
+
+		// The records of the requests come before the end of the session
+		require.Eventually(t, func() bool {
+			for _, call := range h.recorder.WriteCalls() {
+				if _, ok := call.Record.(*journal.SessionEnd); ok {
+					return true
+				}
+			}
+			return false
+		}, testTimeout, 10*time.Millisecond)
+		order := []string{}
+		for _, call := range h.recorder.WriteCalls() {
+			switch r := call.Record.(type) {
+			case *journal.Request:
+				if r.RequestID == closedDescribe.String() || r.RequestID == closedAsk.String() {
+					order = append(order, "request")
+				}
+			case *journal.SessionEnd:
+				order = append(order, "session_end")
+			}
+		}
+		require.Equal(t, []string{"request", "request", "session_end"}, order)
+		for _, id := range []uuid.UUID{cancelled, replaced, question, closedDescribe, closedAsk} {
+			require.Equal(t, 1, count(id))
+		}
+	})
+
+	t.Run("must_pass_shutdown_waits_for_records", func(t *testing.T) {
+		setup()
+		question := uuid.New()
+		c.send(t, fmt.Sprintf(`{"type":"ask.start","request_id":"%s","trigger":"hold","with_image":false}`, question))
+		require.Eventually(t, func() bool { return h.server.registry.activeRequests() == 1 }, testTimeout, time.Millisecond)
+
+		// The grace period ends with the question still waiting for ask.end
+		h.server.registry.Shutdown(context.Background(), 0)
+
+		// Everything is recorded by the time Shutdown returns: the journal is stopped next
+		records := []string{}
+		for _, call := range h.recorder.WriteCalls() {
+			switch r := call.Record.(type) {
+			case *journal.Request:
+				if r.RequestID == question.String() {
+					records = append(records, "request")
+				}
+			case *journal.SessionEnd:
+				records = append(records, "session_end")
+			}
+		}
+		require.Equal(t, []string{"request", "session_end"}, records)
+		require.Zero(t, h.server.Sessions())
 	})
 }

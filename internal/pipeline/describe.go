@@ -218,9 +218,11 @@ type DescribeRequest struct {
 // TTS and AUDIO_OUT, then answer.end with the timings. accepted is sent by the session.
 // It returns when the request is over; a cancelled request sends nothing more.
 func (p *Pipeline) Describe(ctx context.Context, req *DescribeRequest, sink Sink) {
-	defer p.beginUser(req.SessionID)()
+	release := sync.OnceFunc(p.beginUser(req.SessionID))
+	defer release()
 	r := p.newRun(ctx, KindDescribe, req.RequestID, req.SessionID, req.ReceivedAt, sink)
 	defer r.cancel()
+	r.release = release
 	r.timings.Set(StageReceive, req.ReceivedAt.Sub(req.StartedAt))
 	r.record.ImageBytes = len(req.Image)
 	r.intent = protocol.IntentDescribe
@@ -280,6 +282,9 @@ type run struct {
 	priority protocol.Priority
 	// staleAt is when a passive result gets stale (PROTO-8); zero for a user request.
 	staleAt time.Time
+	// release ends the request in the counters of its session before its last message
+	// (sendLast); idempotent, nil if the request is not counted.
+	release func()
 
 	mu             sync.Mutex
 	started        bool // answer.start is sent
@@ -507,7 +512,7 @@ func (p *Pipeline) end(r *run, objects []protocol.SceneObject, hasHazard bool) s
 	}
 
 	r.timings.Set(StageServerTotal, time.Since(r.received))
-	r.sink.Send(&protocol.AnswerEnd{
+	r.sendLast(&protocol.AnswerEnd{
 		RequestID:      r.uuid,
 		Text:           text,
 		Intent:         r.intent,
@@ -534,7 +539,17 @@ func (r *run) fail(protocolErr *protocol.Error, cause error) {
 		return
 	}
 	logger.Warning("request failed: request_id=%s kind=%s code=%s error=%v", r.id, r.kind, protocolErr.Code, cause)
-	r.sink.Send(protocol.NewErrorMessage(&r.uuid, protocolErr))
+	r.sendLast(protocol.NewErrorMessage(&r.uuid, protocolErr))
+}
+
+// sendLast sends the last message of the request - answer.end, passive.clear or error.
+// The request leaves the counters of its session first: the application may send the
+// next request as soon as it gets this message, and it must not be skipped (PROTO-8).
+func (r *run) sendLast(message protocol.Message) {
+	if r.release != nil {
+		r.release()
+	}
+	r.sink.Send(message)
 }
 
 // answerStarted reports whether answer.start is sent.

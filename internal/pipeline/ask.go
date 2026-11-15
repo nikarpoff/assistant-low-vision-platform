@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -10,6 +11,7 @@ import (
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/describer"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/history"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/intent"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/journal"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/logger"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/protocol"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/upstream/detector"
@@ -68,7 +70,8 @@ type detection struct {
 // scene of the device younger than APP_SCENE_FRESHNESS_MS, otherwise the history alone.
 // accepted is sent by the session at ask.end.
 func (p *Pipeline) Ask(ctx context.Context, req *AskRequest, sink Sink) {
-	defer p.beginUser(req.SessionID)()
+	release := sync.OnceFunc(p.beginUser(req.SessionID))
+	defer release()
 
 	detected := make(chan detection, 1)
 	go p.detectQuestion(ctx, req, detected)
@@ -77,16 +80,13 @@ func (p *Pipeline) Ask(ctx context.Context, req *AskRequest, sink Sink) {
 	select {
 	case end = <-req.End:
 	case <-ctx.Done():
-		status := StatusCancelled
-		if errors.Is(context.Cause(ctx), ErrRejected) {
-			status = StatusError
-		}
-		p.deps.Metrics.Requests.WithLabelValues(KindAsk, status).Inc()
+		p.endUnstarted(ctx, req)
 		return
 	}
 
 	r := p.newRun(ctx, KindAsk, req.RequestID, req.SessionID, end.ReceivedAt, sink)
 	defer r.cancel()
+	r.release = release
 
 	transcript, ok := p.recognize(r, end.Audio)
 	if !ok {
@@ -183,13 +183,38 @@ func (p *Pipeline) recognize(r *run, audio []byte) (string, bool) {
 	return response.Text, true
 }
 
+// endUnstarted counts and records a question that ended before ask.end: cancelled by
+// the application or the session, or rejected by the session with an error whose code
+// is in the cause (PLT-11).
+func (p *Pipeline) endUnstarted(ctx context.Context, req *AskRequest) {
+	status, code := StatusCancelled, ""
+	if cause := context.Cause(ctx); errors.Is(cause, ErrRejected) {
+		status, code = StatusError, string(protocol.CodeOf(cause))
+	}
+	p.deps.Metrics.Requests.WithLabelValues(KindAsk, status).Inc()
+
+	record := &journal.Request{
+		RequestID:     req.RequestID.String(),
+		SessionID:     req.SessionID,
+		Kind:          KindAsk,
+		DescriberMode: string(p.deps.Describer.Mode()),
+		Status:        status,
+		ErrorCode:     code,
+		CreatedAt:     req.StartedAt.UTC(),
+	}
+	if current := p.deps.Config.Current(); current != nil {
+		record.ConfigID = current.ConfigID
+	}
+	p.deps.Recorder.Write(record)
+}
+
 // command ends a command the application executes: answer.end with an empty text and
 // without audio right after transcript (PROTO-7).
 func (p *Pipeline) command(r *run) {
 	r.status = StatusOK
 	r.timings.Set(StageServerTotal, time.Since(r.received))
 	r.record.Objects = []byte("[]")
-	r.sink.Send(&protocol.AnswerEnd{
+	r.sendLast(&protocol.AnswerEnd{
 		RequestID: r.uuid,
 		Intent:    r.intent,
 		Objects:   []protocol.SceneObject{},
