@@ -14,7 +14,7 @@
 
 В репозитории также лежат развёртывание всей системы (`deployments/`), эталонные контракты сервисов (`testdata/contracts/`) и инструменты эксперимента. Требования - в [docs/spec.md](docs/spec.md).
 
-Состояние: версия 0.1.0 в разработке. Готовы каркас (настройки, логгер, метрики, HTTP-сервер с `/health`, образ и CI), WebSocket-сессия `/v1/session`, конвейеры описания по касанию, вопроса и пассивного режима с цепочкой деградации PLT-9, журнал в PostgreSQL и статистика `/v1/stats` с проверкой админ-токена. Подключение журнала к конвейерам, `/ready`, `/metrics`, `/v1/config` и `/v1/stats` появятся следующими изменениями.
+Состояние: версия 0.1.0 в разработке. Шлюз собран целиком: WebSocket-сессия `/v1/session`, конвейеры описания по касанию, вопроса и пассивного режима с цепочкой деградации PLT-9, журнал в PostgreSQL (запросы, сессии, `client.metrics`, снимки конфигурации), `/health`, `/ready`, `/metrics`, `/v1/stats` и `/v1/config`.
 
 ## Стек технологий
 
@@ -253,12 +253,37 @@ PLT-9:
 |-------|------|----------|---|
 | GET | `/health` | Проверка живости, ответ `200` и текст `OK` | да |
 | GET | `/v1/session` | WebSocket-сессия приложения (протокол `alv.v1`), токен устройства | да |
-| GET | `/ready` | Готовность: статусы детектора, ASR, TTS, языковой модели, журнала и словаря; `503`, если обязательный сервис недоступен | нет |
-| GET | `/metrics` | Метрики Prometheus | нет |
-| GET | `/v1/stats` | Статистика по журналу: p50 и p95 этапов, доли деградации и откатов; админ-токен | обработчик готов, маршрут подключается при сборке Шлюза |
-| GET | `/v1/config` | Снимок конфигурации стенда и `config_id`; админ-токен | нет |
+| GET | `/ready` | Готовность: статусы детектора, ASR, TTS, языковой модели, журнала и словаря; `503`, если обязательный сервис недоступен | да |
+| GET | `/metrics` | Метрики Prometheus | да |
+| GET | `/v1/stats` | Статистика по журналу: p50 и p95 этапов, доли деградации и откатов; админ-токен | да |
+| GET | `/v1/config` | Снимок конфигурации стенда и `config_id`; админ-токен | да |
 
-Подробности - PLT-13 в [docs/spec.md](docs/spec.md). Ошибка `500` всегда обезличена: `{"error": "internal server error"}`, подробности только в логе.
+Подробности - PLT-13 в [docs/spec.md](docs/spec.md). Ошибка `500` всегда обезличена: `{"error": "internal server error"}`, подробности только в логе; паника обработчика тоже даёт такой ответ. `/health`, `/ready` и `/metrics` работают без токена.
+
+### GET /ready
+
+Детектор, ASR и TTS опрашиваются при каждом запросе одновременно (`GET /v1/info` с токеном сервиса, не дольше 2 с). `llm` - результат последнего `GET <APP_LLM_URL>/models` с ключом поставщика: проверка идёт при старте и раз в `APP_CONFIG_REFRESH_S` по тому же пулу keep-alive соединений, что и запросы к модели, и не даёт соединению закрыться по простою (PLT-15). До первой проверки `llm` - `down`, в режиме `template` - `disabled`. `journal` - состояние писателя журнала: `ok` после успешной записи или миграции, `down` при недоступной базе, `disabled` при пустом `APP_POSTGRES_DSN`.
+
+```json
+{"status":"ready","detector":"ok","asr":"ok","tts":"ok","llm":"ok","journal":"ok","vocabulary":"loaded"}
+```
+
+- `detector`, `asr`, `tts`, `llm`, `journal` - `ok`, `down` или `disabled`; `vocabulary` - `loaded` или `not_loaded`; `status` - `ready` или `not_ready`.
+- `200`, если словарь загружен и отвечают ASR, TTS и детектор (в режиме `vlm` детектор не обязателен); иначе `503`. `llm` и `journal` на код не влияют: без них Шлюз деградирует (PLT-9).
+
+### GET /v1/config
+
+Текущий снимок конфигурации стенда (PLT-12), заголовок `Authorization: Bearer <APP_ADMIN_TOKEN>`; без него - `401`. Метка варианта размещения - поле `placement` верхнего уровня `config`. Ключей, токенов и пароля базы в снимке нет.
+
+```bash
+curl -H "Authorization: Bearer $APP_ADMIN_TOKEN" http://127.0.0.1:8080/v1/config
+```
+
+```json
+{"config_id":"c9f2a1d0e3b4","collected_at":"2026-11-01T10:00:00Z","config":{"placement":"B","describer_mode":"llm","llm":{"url":"https://polza.ai/api/v1","model":"qwen/qwen3-8b"},"...":"..."}}
+```
+
+Коды: `200`; `401` - нет админ-токена; `503` - снимок ещё не собран; `500` - обезличенная ошибка.
 
 ### GET /v1/stats
 
@@ -297,7 +322,7 @@ curl -H "Authorization: Bearer $APP_ADMIN_TOKEN" \
 
 ### Метрики
 
-Все метрики объявлены в `internal/metrics` в собственном реестре:
+Все метрики объявлены в `internal/metrics` в собственном реестре и отдаются `GET /metrics`:
 
 | Метрика | Тип | Метки |
 |---|---|---|
@@ -308,6 +333,17 @@ curl -H "Authorization: Bearer $APP_ADMIN_TOKEN" \
 | `alv_sessions_active` | показатель | - |
 | `alv_journal_dropped_total` | счётчик | - |
 
+`alv_e2e_duration_seconds` наполняет `client.metrics` приложения: `trigger_to_first_audio_ms` в секундах, `kind` - вид запроса с этим `request_id` в той же сессии (сессия помнит виды последних 64 запросов), `network` - из сообщения. Для `upstream="llm"` значения `reason` - виды отказа PLT-15; проверки `/models` в этот счётчик не входят.
+
+### Журнал
+
+Журнал (PLT-11) пишется асинхронно, запрос не ждёт базу:
+- сессия - при `hello` (устройство, версия приложения, сеть, `label`) и её конец при закрытии соединения;
+- запрос - когда конвейер закончил: статус, этапы, `image_bytes` (только размер снимка), расшифровка, ответ, объекты, `config_id`, `llm_model`, `llm_system_fingerprint`, `llm_error`;
+- `client.metrics` - в `client_metric` по имени метрики;
+- снимок конфигурации - при старте и при каждом обновлении (`ON CONFLICT DO NOTHING` по `config_id`).
+
+Снимки и аудио не сохраняются никогда: ни в базе, ни файлами, ни в логе; настройки, которая бы это включала, нет (NFR-8).
 ## Сервисы ИИ-моделей
 
 Клиенты детектора, ASR и TTS лежат в `internal/upstream/{detector,asr,tts}` (PLT-15 в [docs/spec.md](docs/spec.md)):
@@ -440,6 +476,7 @@ OpenAI-совместимая заглушка языковой модели д�
 
 - `POST /v1/chat/completions` - только `stream: true` (иначе `400 BAD_REQUEST`). Детерминированный текст потоком SSE в формате Polza.ai: комментарий `: PROCESSING`, фрагмент с ролью, после задержки первого токена - фрагменты `chat.completion.chunk` по словам с `model` и `system_fingerprint: fp_fake`, фрагмент с `finish_reason: "stop"`, фрагмент `usage` с пустым `choices`, `data: [DONE]`.
 - `GET /v1/models` - список из одной модели.
+- `GET /health` - `200` и `OK`, без ключа; в `Requests()` не попадает.
 - Ошибки - в формате Polza.ai: до потока `{"error": {"code": "...", "message": "...", "trace_id": "fake-trace"}, "trace_id": "fake-trace"}`, в потоке - фрагмент с `id` `error_fake`, полем `error`, `trace_id` и `finish_reason: "error"`, за которым идёт `data: [DONE]`.
 
 ```bash
@@ -456,6 +493,7 @@ go run ./cmd/fakellm --port 8090 --fail stream_error_after_sentence
 | `FAKELLM_FIRST_TOKEN_DELAY_MS` | `--first-token-delay-ms` | Задержка первого токена (мс) | `0` |
 | `FAKELLM_TOKEN_DELAY_MS` | `--token-delay-ms` | Задержка между токенами (мс) | `0` |
 | `FAKELLM_FAIL` | `--fail` | Режим отказа, см. ниже | `none` |
+| - | `-healthcheck` | Только проверить `GET http://127.0.0.1:<FAKELLM_PORT>/health` запущенной заглушки и выйти с кодом 0 или 1 | - |
 
 | `FAKELLM_FAIL` | Поведение |
 |---|---|
@@ -498,6 +536,8 @@ APP_LLM_API_KEY=... go run ./cmd/llmbench --url https://polza.ai/api/v1 --model 
 ## Развёртывание
 
 Файлы compose для вариантов размещения A и B и стенда на заглушках, Caddy с TLS, примеры туннеля WireGuard, прокси gpt2giga с сертификатом НУЦ, загрузка весов и живая проверка поставщиков - в [deployments/README.md](deployments/README.md).
+
+Образ distroless, в нём нет shell и curl, поэтому healthcheck контейнеров `gateway` и `fakellm` - сам бинарник: `/gateway -healthcheck` проверяет `GET http://127.0.0.1:${APP_SERVER_PORT}/health`, `/fakellm -healthcheck` - то же на `FAKELLM_PORT`; код выхода 0 или 1.
 
 ## Разработка
 
@@ -570,7 +610,7 @@ go vet ./...
 cmd/gateway/main.go               # точка входа: логгер, конфигурация, запуск internal/app, остановка по сигналу
 cmd/fakellm/main.go               # заглушка поставщика языковой модели для тестов и сквозной проверки
 cmd/llmbench/main.go              # замер поставщика языковой модели (LLM-4)
-endpoints/httpserver/             # HTTP-сервер и регистрация маршрутов
+endpoints/httpserver/             # HTTP-сервер, регистрация маршрутов, админ-токен и обезличенный 500
 internal/env/                     # переменные окружения (Vars) и проверки при старте
 internal/logger/                  # printf-логгер: строки "<LEVEL>: <message>"
 internal/metrics/                 # метрики Prometheus в собственном реестре
@@ -591,14 +631,16 @@ internal/history/                 # история устройства: сце�
 internal/describer/               # описание сцены: шаблон, промпт, режимы llm и vlm
 internal/pipeline/                # конвейеры запросов: описание по касанию, вопрос, пассивный режим, деградация, поток предложений, TTS по порядку, этапы
 internal/session/                 # WebSocket-сессии: рукопожатие, кадры и сообщения, отмена, keepalive, реестр
-internal/app/                     # сборка Шлюза из настроек: клиенты, словарь, описатель, конвейеры, сессии
+internal/app/                     # сборка Шлюза из настроек: клиенты, словарь, описатель, конвейеры, сессии, журнал, снимок, проверка поставщика
 internal/servicestub/             # заглушки детектора, ASR и TTS на httptest для тестов
-internal/utils/                   # валидатор запросов
+internal/utils/                   # валидатор запросов, проверка /health для -healthcheck
 internal/postgres/                # пул соединений pgx за интерфейсом для моков
 internal/journal/                 # журнал: записи, асинхронный писатель, репозиторий, миграции
 internal/stats/                   # перцентили, доля откатов и статистика /v1/stats
 internal/handlers/adminauth/      # проверка админ-токена /v1/stats и /v1/config
 internal/handlers/statshandler/   # обработчик GET /v1/stats
+internal/handlers/readyhandler/   # обработчик GET /ready
+internal/handlers/confighandler/  # обработчик GET /v1/config
 migrations/                       # SQL-миграции журнала (встраиваются в бинарник)
 configs/                          # встроенные правила опасности и фразы намерений
 prompts/                          # встроенные шаблоны промпта: <имя>/system.txt и <имя>/user.tmpl

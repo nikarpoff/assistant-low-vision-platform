@@ -35,7 +35,7 @@
 | `fetch-weights.sh` | машина моделей | загрузка весов моделей в тома |
 | `llm-live-check.sh` | VM или машина разработки | живая проверка Polza.ai и GigaChat настоящими ключами |
 
-Имена сервисов во всех файлах: `caddy`, `gateway`, `postgres`, `gpt2giga`, `detector`, `asr`, `tts`, `fakellm`. Сеть Docker - `alv-net`, compose создаёт её сам. У каждого сервиса `restart: unless-stopped`; Шлюз стартует независимо от сервисов ИИ-моделей, а его готовность показывает `/ready`.
+Имена сервисов во всех файлах: `caddy`, `gateway`, `postgres`, `gpt2giga`, `detector`, `asr`, `tts`, `fakellm`. Сеть Docker - `alv-net`, compose создаёт её сам. У каждого сервиса `restart: unless-stopped`; healthcheck `gateway` и `fakellm` (образ distroless без curl) - `/gateway -healthcheck` и `/fakellm -healthcheck`. Шлюз стартует независимо от сервисов ИИ-моделей, а его готовность показывает `/ready`.
 
 Образы:
 - свои - `ghcr.io/nikarpoff/<репозиторий>:<ALV_IMAGE_TAG>`, у сервисов ИИ-моделей с суффиксом варианта: `latest-cuda`, `v0.1.0-cpu`. Образ Шлюза один на все инструменты: `/gateway` - точка входа, `/fakellm`, `/loadgen`, `/score`, `/llmbench` запускаются заменой `entrypoint`, поэтому Go и Python на VM не нужны;
@@ -324,7 +324,7 @@ docker compose --env-file .env.example -f compose.fake.yml -f compose.local-buil
 | Признак | Причина и решение |
 |---|---|
 | `bind: cannot assign requested address` для `10.77.0.2` | туннель не поднят: сначала `wg-quick up wg0`, потом compose |
-| `/ready` - 503, детектор, ASR или TTS `unavailable` | туннель или сервисы не работают: `wg show`, `curl http://10.77.0.2:8101/health` с VM, `docker compose ... ps` на машине моделей; совпадают ли `*_AUTH_TOKEN` в `.env` обеих машин (иначе `unauthorized`) |
+| `/ready` - 503, детектор, ASR или TTS `down` | туннель или сервисы не работают: `wg show`, `curl http://10.77.0.2:8101/health` с VM, `docker compose ... ps` на машине моделей; совпадают ли `*_AUTH_TOKEN` в `.env` обеих машин (иначе `unauthorized`) |
 | Шлюз перезапускается с `APP_LLM_MODEL environment variable is required in llm mode` | не задана модель; на эталонном стенде `reference.env` ещё не заполнен задачей 002 |
 | Шлюз перезапускается с `APP_DEVICE_TOKENS environment variable is required` | не заданы токены устройства или админа |
 | Caddy не получает сертификат | A-запись не указывает на IP VM, закрыт порт 80 или 443, исчерпан лимит Let's Encrypt; `docker compose ... logs caddy` |
@@ -333,7 +333,7 @@ docker compose --env-file .env.example -f compose.fake.yml -f compose.local-buil
 | Журнал не пишется после смены `POSTGRES_PASSWORD` | пароль задаётся только при первом создании тома `postgres-data`: верните прежний или пересоздайте том (журнал будет потерян) |
 | gpt2giga: `CERTIFICATE_VERIFY_FAILED` | файл `certs/russian_trusted_root_ca.pem` повреждён или GigaChat сменил цепочку; сверьте отпечаток, при необходимости допишите Russian Trusted Sub CA. Проверку TLS не отключать |
 | gpt2giga: 401 от прокси | `APP_LLM_API_KEY` Шлюза не совпадает с ключом прокси: оба берутся из одной переменной, пересоздайте оба контейнера |
-| `llm` в `/ready` - `unavailable` с `insufficient_balance` в журнале | у поставщика кончились средства или лимит расходов |
+| `llm` в `/ready` - `down` или `insufficient_balance` в `llm_error` журнала | у поставщика кончились средства или лимит расходов |
 | Сервис долго стартует или падает с ошибкой загрузки весов | веса не скачаны: `./fetch-weights.sh`; на машине без сети - скачать заранее |
 | `could not select device driver "nvidia"` | на машине моделей не установлен NVIDIA Container Toolkit |
 | `port is already allocated` для 8080 или 8104 | порт занят другим стендом или gpt2giga: остановите его (`docker compose ... down`) |

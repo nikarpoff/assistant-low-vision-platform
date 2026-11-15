@@ -84,6 +84,13 @@ services:
     environment:
       FAKELLM_PORT: "8000"
       FAKELLM_MODEL: fake/fake-llm
+    # The distroless image has no shell and curl: the binary checks its own /health (DEP-7)
+    healthcheck:
+      test: ["CMD", "/fakellm", "-healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 # Compose creates the network itself: no manual `docker network create`
 networks:

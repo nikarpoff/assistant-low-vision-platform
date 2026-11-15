@@ -72,6 +72,8 @@ type Config struct {
 
 	// Text is the answer; empty means DefaultText. Only tests in process set it.
 	Text string
+	// Healthcheck is the flag -healthcheck: the command only checks GET /health of a running stub.
+	Healthcheck bool
 }
 
 // LoadConfig reads FAKELLM_* variables, then the command line flags, and checks the result.
@@ -92,6 +94,7 @@ func LoadConfig(args []string) (*Config, error) {
 	flags.IntVar(&cfg.FirstTokenDelayMS, "first-token-delay-ms", cfg.FirstTokenDelayMS, "delay of the first token, ms (FAKELLM_FIRST_TOKEN_DELAY_MS)")
 	flags.IntVar(&cfg.TokenDelayMS, "token-delay-ms", cfg.TokenDelayMS, "delay between tokens, ms (FAKELLM_TOKEN_DELAY_MS)")
 	flags.StringVar(&fail, "fail", fail, "failure mode (FAKELLM_FAIL)")
+	flags.BoolVar(&cfg.Healthcheck, "healthcheck", false, "check GET /health of the stub on 127.0.0.1 and exit with 0 or 1")
 	if err := flags.Parse(args); err != nil {
 		return nil, fmt.Errorf(errParseFlagsFormat, err)
 	}

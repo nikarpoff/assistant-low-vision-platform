@@ -60,6 +60,7 @@ type harness struct {
 	detector *servicestub.Detector
 	tts      *servicestub.TTS
 	metrics  *metrics.Metrics
+	recorder *RecorderMock
 	cfg      Config
 }
 
@@ -124,7 +125,8 @@ func newHarness(t *testing.T, mutate func(cfg *Config)) *harness {
 	if mutate != nil {
 		mutate(&h.cfg)
 	}
-	h.server = NewServer(h.cfg, pipelines, configSource, h.metrics)
+	h.recorder = &RecorderMock{WriteFunc: func(journal.Record) {}}
+	h.server = NewServer(h.cfg, pipelines, configSource, h.recorder, h.metrics)
 	h.http = httptest.NewServer(h.server)
 	t.Cleanup(h.http.Close)
 	return h
@@ -707,4 +709,112 @@ func requestIDOf(got received) uuid.UUID {
 		}
 	}
 	return uuid.Nil
+}
+
+func TestSession_Journal(t *testing.T) {
+	var (
+		h *harness
+	)
+
+	setup := func() {
+		logger.InitTestLogger()
+		h = newHarness(t, nil)
+	}
+
+	// records returns the journal records of the session of the given type.
+	records := func(kind any) []journal.Record {
+		found := []journal.Record{}
+		for _, call := range h.recorder.WriteCalls() {
+			if fmt.Sprintf("%T", call.Record) == fmt.Sprintf("%T", kind) {
+				found = append(found, call.Record)
+			}
+		}
+		return found
+	}
+
+	t.Run("must_pass_session_records", func(t *testing.T) {
+		setup()
+		c, _, err := h.dial(testToken, Subprotocol)
+		require.NoError(t, err)
+		c.send(t, `{"type":"hello","protocol":1,"device_id":"5f0c3a52-8a0b-4d4e-9c61-3f1d2b7a9e10","app_version":"0.1.0","locale":"ru-RU","platform":"android-34","network":"cellular","label":"P07"}`)
+		welcome := c.next(t).message.(*protocol.Welcome)
+
+		require.NoError(t, c.conn.Close())
+
+		require.Eventually(t, func() bool { return len(records(&journal.SessionEnd{})) == 1 }, testTimeout, 10*time.Millisecond)
+		started := records(&journal.Session{})
+		require.Len(t, started, 1)
+		session := started[0].(*journal.Session)
+		require.Equal(t, welcome.SessionID.String(), session.SessionID)
+		require.Equal(t, "5f0c3a52-8a0b-4d4e-9c61-3f1d2b7a9e10", session.DeviceID)
+		require.Equal(t, "0.1.0", session.AppVersion)
+		require.Equal(t, "cellular", session.Network)
+		require.Equal(t, "P07", session.Label)
+		require.Equal(t, time.UTC, session.StartedAt.Location())
+		end := records(&journal.SessionEnd{})[0].(*journal.SessionEnd)
+		require.Equal(t, session.SessionID, end.SessionID)
+		require.False(t, end.EndedAt.Before(session.StartedAt))
+	})
+
+	t.Run("must_pass_no_session_without_hello", func(t *testing.T) {
+		setup()
+		c, _, err := h.dial(testToken, Subprotocol)
+		require.NoError(t, err)
+
+		require.NoError(t, c.conn.Close())
+
+		require.Eventually(t, func() bool { return h.server.Sessions() == 0 }, testTimeout, 10*time.Millisecond)
+		require.Empty(t, h.recorder.WriteCalls())
+	})
+
+	t.Run("must_pass_client_metrics", func(t *testing.T) {
+		setup()
+		c := h.open(t)
+		id := uuid.New()
+		c.describe(t, id, testImage)
+		c.until(t, id)
+
+		c.send(t, fmt.Sprintf(`{"type":"client.metrics","request_id":"%s","network":"wifi","metrics":{"capture_ms":35,"encode_ms":20,"trigger_to_send_ms":70,"trigger_to_accepted_ms":120,"trigger_to_first_audio_ms":1310,"playback_underruns":0}}`, id))
+
+		require.Eventually(t, func() bool { return len(records(&journal.ClientMetrics{})) == 1 }, testTimeout, 10*time.Millisecond)
+		require.Equal(t, &journal.ClientMetrics{RequestID: id.String(), Metrics: map[string]float64{
+			"capture_ms": 35, "encode_ms": 20, "trigger_to_send_ms": 70, "trigger_to_accepted_ms": 120,
+			"trigger_to_first_audio_ms": 1310, "playback_underruns": 0,
+		}}, records(&journal.ClientMetrics{})[0])
+		require.Equal(t, 1, testutil.CollectAndCount(h.metrics.E2EDuration))
+		expected := `
+# HELP alv_e2e_duration_seconds Time from the trigger to the first audio reported by the application in client.metrics.
+# TYPE alv_e2e_duration_seconds histogram
+alv_e2e_duration_seconds_sum{kind="describe",network="wifi"} 1.31
+alv_e2e_duration_seconds_count{kind="describe",network="wifi"} 1
+`
+		require.NoError(t, testutil.CollectAndCompare(h.metrics.E2EDuration, strings.NewReader(expected), "alv_e2e_duration_seconds_sum", "alv_e2e_duration_seconds_count"))
+	})
+
+	t.Run("must_pass_client_metrics_after_error_without_e2e", func(t *testing.T) {
+		setup()
+		c := h.open(t)
+		id := uuid.New()
+
+		c.send(t, fmt.Sprintf(`{"type":"client.metrics","request_id":"%s","network":"cellular","metrics":{"trigger_to_send_ms":70}}`, id))
+		c.requireOpen(t)
+
+		require.Equal(t, &journal.ClientMetrics{RequestID: id.String(), Metrics: map[string]float64{"trigger_to_send_ms": 70}}, records(&journal.ClientMetrics{})[0])
+		require.Zero(t, testutil.CollectAndCount(h.metrics.E2EDuration))
+	})
+
+	t.Run("must_pass_recent_kinds_bounded", func(t *testing.T) {
+		setup()
+		s := newSession(h.server, nil)
+		first := uuid.New()
+
+		s.rememberKind(first, pipeline.KindAsk)
+		for i := 0; i < recentKinds; i++ {
+			s.rememberKind(uuid.New(), pipeline.KindDescribe)
+		}
+
+		require.Len(t, s.kinds, recentKinds)
+		require.Len(t, s.kindOrder, recentKinds)
+		require.NotContains(t, s.kinds, first)
+	})
 }

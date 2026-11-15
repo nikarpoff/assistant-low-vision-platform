@@ -32,7 +32,7 @@ func TestNewServer(t *testing.T) {
 			w.WriteHeader(http.StatusSwitchingProtocols)
 		})
 		vars = &env.Vars{AppServerPort: 80, AppServerReadTimeout: 15, AppServerWriteTimeout: 15, AppServerIdleTimeout: 60, AppServerShutdownTimeout: 5}
-		server = NewServer(vars, sessions)
+		server = NewServer(vars, Handlers{Sessions: sessions})
 		response = httptest.NewRecorder()
 	}
 
@@ -94,7 +94,7 @@ func TestNewServer(t *testing.T) {
 		require.NoError(t, err)
 		vars.AppServerPort = listener.Addr().(*net.TCPAddr).Port
 		require.NoError(t, listener.Close())
-		server = NewServer(vars, sessions)
+		server = NewServer(vars, Handlers{Sessions: sessions})
 		done := make(chan error, 1)
 
 		go func() {
@@ -121,11 +121,120 @@ func TestNewServer(t *testing.T) {
 		require.NoError(t, err)
 		defer listener.Close()
 		vars.AppServerPort = listener.Addr().(*net.TCPAddr).Port
-		server = NewServer(vars, sessions)
+		server = NewServer(vars, Handlers{Sessions: sessions})
 
 		err = server.Run()
 
 		require.ErrorContains(t, err, "address already in use")
 		require.Contains(t, getLogs(), "ERROR: failed to serve HTTP: ")
+	})
+}
+
+func TestHealth(t *testing.T) {
+	var (
+		server   *Server
+		response *httptest.ResponseRecorder
+	)
+
+	setup := func() {
+		logger.InitTestLogger()
+		server = NewServer(&env.Vars{AppServerPort: 80}, Handlers{})
+		response = httptest.NewRecorder()
+	}
+
+	t.Run("must_pass", func(t *testing.T) {
+		setup()
+
+		server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+		require.Equal(t, http.StatusOK, response.Code)
+		require.Equal(t, "OK", response.Body.String())
+	})
+
+	t.Run("must_pass_without_token", func(t *testing.T) {
+		setup()
+		request := httptest.NewRequest(http.MethodGet, "/health", nil)
+		request.Header.Set("Authorization", "Bearer wrong")
+
+		server.Handler().ServeHTTP(response, request)
+
+		require.Equal(t, http.StatusOK, response.Code)
+	})
+}
+
+func TestRoutes(t *testing.T) {
+	var (
+		server   *Server
+		response *httptest.ResponseRecorder
+		served   []string
+		getLogs  func() string
+	)
+
+	handler := func(name string) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			served = append(served, name)
+			w.WriteHeader(http.StatusOK)
+		})
+	}
+
+	setup := func() {
+		getLogs = logger.InitTestLogger()
+		served = nil
+		server = NewServer(&env.Vars{AppServerPort: 80, AppAdminToken: "admin-token"}, Handlers{
+			Sessions: handler("sessions"),
+			Ready:    handler("ready"),
+			Metrics:  handler("metrics"),
+			Stats:    handler("stats"),
+			Config:   handler("config"),
+		})
+		response = httptest.NewRecorder()
+	}
+
+	t.Run("must_pass_public_routes", func(t *testing.T) {
+		for path, name := range map[string]string{"/ready": "ready", "/metrics": "metrics", "/v1/session": "sessions"} {
+			setup()
+
+			server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+
+			require.Equal(t, http.StatusOK, response.Code, path)
+			require.Equal(t, []string{name}, served)
+		}
+	})
+
+	t.Run("must_pass_admin_routes", func(t *testing.T) {
+		for path, name := range map[string]string{"/v1/stats": "stats", "/v1/config": "config"} {
+			setup()
+			request := httptest.NewRequest(http.MethodGet, path, nil)
+			request.Header.Set("Authorization", "Bearer admin-token")
+
+			server.Handler().ServeHTTP(response, request)
+
+			require.Equal(t, http.StatusOK, response.Code, path)
+			require.Equal(t, []string{name}, served)
+		}
+	})
+
+	t.Run("must_fail_admin_routes_unauthorized", func(t *testing.T) {
+		for _, path := range []string{"/v1/stats", "/v1/config"} {
+			setup()
+
+			server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+
+			require.Equal(t, http.StatusUnauthorized, response.Code, path)
+			require.Empty(t, served)
+		}
+	})
+
+	t.Run("must_fail_panic_impersonal", func(t *testing.T) {
+		setup()
+		server = NewServer(&env.Vars{AppServerPort: 80}, Handlers{Ready: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			panic("secret detail")
+		})})
+
+		server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/ready", nil))
+
+		require.Equal(t, http.StatusInternalServerError, response.Code)
+		require.JSONEq(t, `{"error":"internal server error"}`, response.Body.String())
+		require.Contains(t, getLogs(), "ERROR: panic in HTTP handler: method=GET path=/ready: secret detail")
 	})
 }

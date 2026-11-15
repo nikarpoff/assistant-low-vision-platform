@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/journal"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/logger"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/pipeline"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/protocol"
@@ -37,6 +38,20 @@ var (
 
 // outboundSize is the room of the write queue of a session.
 const outboundSize = 256
+
+// Names of the metrics of the application in client.metrics (PLT-14): the names of client_metric in the journal.
+const (
+	clientMetricCapture             = "capture_ms"
+	clientMetricEncode              = "encode_ms"
+	clientMetricTriggerToSend       = "trigger_to_send_ms"
+	clientMetricTriggerToAccepted   = "trigger_to_accepted_ms"
+	clientMetricTriggerToFirstAudio = "trigger_to_first_audio_ms"
+	clientMetricPlaybackUnderruns   = "playback_underruns"
+)
+
+// recentKinds is how many request kinds a session remembers for client.metrics, which
+// comes after the request is over and does not name its kind (alv_e2e_duration_seconds{kind}).
+const recentKinds = 64
 
 // readLimitSlack is what a frame may exceed the snapshot limit by and still get
 // payload_too_large instead of closing the connection.
@@ -88,9 +103,11 @@ type Session struct {
 	closeOnce sync.Once
 	active    atomic.Int32 // requests whose pipeline is running
 
-	// hello and ignored belong to the reader goroutine.
-	hello   *protocol.Hello
-	ignored map[uuid.UUID]bool // skipped passive requests whose snapshot is still to come
+	// hello, ignored, kinds and kindOrder belong to the reader goroutine.
+	hello     *protocol.Hello
+	ignored   map[uuid.UUID]bool // skipped passive requests whose snapshot is still to come
+	kinds     map[uuid.UUID]string
+	kindOrder []uuid.UUID // the oldest first, at most recentKinds
 
 	mu      sync.Mutex
 	user    *request // describe on_demand or ask
@@ -108,6 +125,7 @@ func newSession(server *Server, conn *websocket.Conn) *Session {
 		out:     make(chan outbound, outboundSize),
 		closed:  make(chan struct{}),
 		ignored: map[uuid.UUID]bool{},
+		kinds:   map[uuid.UUID]string{},
 	}
 }
 
@@ -143,6 +161,9 @@ func (s *Session) run() {
 	}
 	s.user, s.passive = nil, nil
 	s.mu.Unlock()
+	if s.hello != nil {
+		s.server.recorder.Write(&journal.SessionEnd{SessionID: s.id.String(), EndedAt: time.Now().UTC()})
+	}
 	logger.Info("Session closed: session_id=%s", s.id)
 }
 
@@ -258,13 +279,70 @@ func (s *Session) handleMessage(data []byte) {
 	case *protocol.Cancel:
 		s.onCancel(m)
 	case *protocol.ClientMetrics:
-		logger.Debug("client metrics: session_id=%s request_id=%s", s.id, m.RequestID)
+		s.onClientMetrics(m)
 	}
+}
+
+// onClientMetrics records the metrics of the phone in the journal (client_metric) and the
+// E2E time in alv_e2e_duration_seconds{kind, network} (PLT-11, PLT-13, MOB-13).
+func (s *Session) onClientMetrics(m *protocol.ClientMetrics) {
+	values := clientMetricValues(&m.Metrics)
+	s.server.recorder.Write(&journal.ClientMetrics{RequestID: m.RequestID.String(), Metrics: values})
+
+	kind, known := s.kinds[m.RequestID]
+	e2e, measured := values[clientMetricTriggerToFirstAudio]
+	if known && measured {
+		s.server.metrics.E2EDuration.WithLabelValues(kind, string(m.Network)).Observe(e2e / 1000)
+	}
+	logger.Debug("client metrics: session_id=%s request_id=%s kind=%s metrics=%d", s.id, m.RequestID, kind, len(values))
+}
+
+// clientMetricValues returns the metrics the application sent, by their names of PLT-14.
+func clientMetricValues(m *protocol.ClientMetricValues) map[string]float64 {
+	values := map[string]float64{}
+	add := func(name string, value *float64) {
+		if value != nil {
+			values[name] = *value
+		}
+	}
+	add(clientMetricCapture, m.CaptureMS)
+	add(clientMetricEncode, m.EncodeMS)
+	add(clientMetricTriggerToSend, m.TriggerToSendMS)
+	add(clientMetricTriggerToAccepted, m.TriggerToAcceptedMS)
+	add(clientMetricTriggerToFirstAudio, m.TriggerToFirstAudioMS)
+	if m.PlaybackUnderruns != nil {
+		values[clientMetricPlaybackUnderruns] = float64(*m.PlaybackUnderruns)
+	}
+	return values
+}
+
+// rememberKind keeps the kind of the request for its client.metrics; the oldest is forgotten.
+func (s *Session) rememberKind(id uuid.UUID, kind string) {
+	if _, ok := s.kinds[id]; !ok {
+		if len(s.kindOrder) == recentKinds {
+			delete(s.kinds, s.kindOrder[0])
+			s.kindOrder = s.kindOrder[1:]
+		}
+		s.kindOrder = append(s.kindOrder, id)
+	}
+	s.kinds[id] = kind
 }
 
 // onHello answers welcome with the config and config_id (PROTO-5, PROTO-13).
 func (s *Session) onHello(hello *protocol.Hello) {
 	s.hello = hello
+	label := ""
+	if hello.Label != nil {
+		label = *hello.Label
+	}
+	s.server.recorder.Write(&journal.Session{
+		SessionID:  s.id.String(),
+		DeviceID:   hello.DeviceID,
+		AppVersion: hello.AppVersion,
+		Network:    string(hello.Network),
+		Label:      label,
+		StartedAt:  time.Now().UTC(),
+	})
 	configID := ""
 	if current := s.server.config.Current(); current != nil {
 		configID = current.ConfigID
@@ -487,6 +565,7 @@ func (s *Session) onAudio(frame *protocol.Frame) {
 
 // newRequest creates a request of the session.
 func (s *Session) newRequest(id uuid.UUID, kind string) *request {
+	s.rememberKind(id, kind)
 	ctx, cancel := context.WithCancelCause(s.ctx)
 	return &request{
 		id:        id,

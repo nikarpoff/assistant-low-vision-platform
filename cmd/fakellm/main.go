@@ -13,6 +13,7 @@ import (
 
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/fakellm"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/logger"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/utils"
 )
 
 // Server timeouts. There is no write timeout: a stream with delays may last long.
@@ -41,6 +42,15 @@ func run() int {
 	if err != nil {
 		logger.Error(err)
 		return 1
+	}
+
+	// Healthcheck of the container: the distroless image has no curl (DEP-7)
+	if cfg.Healthcheck {
+		if err := utils.Healthcheck(cfg.Port); err != nil {
+			logger.Error(err)
+			return 1
+		}
+		return 0
 	}
 
 	logger.Info("Configuration loaded: port=%d model=%s fail=%s first_token_delay_ms=%d token_delay_ms=%d auth=%t",

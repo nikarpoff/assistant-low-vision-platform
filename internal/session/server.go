@@ -21,6 +21,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/env"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/journal"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/logger"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/metrics"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/pipeline"
@@ -86,6 +87,14 @@ type ConfigSource interface {
 	Current() *snapshot.Snapshot
 }
 
+//go:generate moq -out recorder_moq_test.go . Recorder
+
+// Recorder takes the records of the journal without waiting for the database (*journal.Writer):
+// the sessions and client.metrics (PLT-11).
+type Recorder interface {
+	Write(record journal.Record)
+}
+
 // Config holds the settings of the session server.
 type Config struct {
 	// AuthDisabled is APP_AUTH_DISABLED: sessions without a device token.
@@ -148,14 +157,15 @@ type Server struct {
 	cfg       Config
 	pipelines Pipelines
 	config    ConfigSource
+	recorder  Recorder
 	metrics   *metrics.Metrics
 	registry  *Registry
 	upgrader  websocket.Upgrader
 	tokens    [][]byte
 }
 
-// NewServer creates the session server.
-func NewServer(cfg Config, pipelines Pipelines, config ConfigSource, m *metrics.Metrics) *Server {
+// NewServer creates the session server. The sessions and client.metrics go to the recorder.
+func NewServer(cfg Config, pipelines Pipelines, config ConfigSource, recorder Recorder, m *metrics.Metrics) *Server {
 	tokens := make([][]byte, 0, len(cfg.DeviceTokens))
 	for _, token := range cfg.DeviceTokens {
 		if token = strings.TrimSpace(token); token != "" {
@@ -167,6 +177,7 @@ func NewServer(cfg Config, pipelines Pipelines, config ConfigSource, m *metrics.
 		cfg:       cfg,
 		pipelines: pipelines,
 		config:    config,
+		recorder:  recorder,
 		metrics:   m,
 		registry:  NewRegistry(m.SessionsActive),
 		tokens:    tokens,

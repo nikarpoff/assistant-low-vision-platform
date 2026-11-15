@@ -67,6 +67,15 @@ func TestLoadConfig(t *testing.T) {
 		require.Empty(t, cfg.APIKey)
 	})
 
+	t.Run("must_pass_healthcheck_flag", func(t *testing.T) {
+		setup(t, map[string]string{"FAKELLM_PORT": "8090"}, "-healthcheck")
+
+		cfg, err := LoadConfig(args)
+
+		require.NoError(t, err)
+		require.Equal(t, &Config{Port: 8090, Model: DefaultModel, Fail: FailNone, Healthcheck: true}, cfg)
+	})
+
 	t.Run("must_pass_every_fail_mode", func(t *testing.T) {
 		for _, mode := range FailModes {
 			setup(t, map[string]string{"FAKELLM_FAIL": string(mode)})

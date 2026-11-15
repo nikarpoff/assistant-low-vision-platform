@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"os"
 	"os/signal"
 	"syscall"
@@ -9,6 +10,7 @@ import (
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/app"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/env"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/logger"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/utils"
 )
 
 func main() {
@@ -17,6 +19,13 @@ func main() {
 
 func run() int {
 	logger.InitStdoutLogger()
+
+	healthcheck := flag.Bool("healthcheck", false, "check GET /health of the gateway on 127.0.0.1:APP_SERVER_PORT and exit with 0 or 1")
+	flag.Parse()
+	if *healthcheck {
+		return checkHealth()
+	}
+
 	logger.Info("Starting gateway")
 
 	stopAppChan := make(chan os.Signal, 1)
@@ -57,5 +66,19 @@ func run() int {
 	}
 
 	logger.Info("Received signal %s, stopping gateway", sig)
+	return 0
+}
+
+// checkHealth is the healthcheck of the container: the distroless image has no curl (DEP-7).
+func checkHealth() int {
+	vars, err := env.Load()
+	if err != nil {
+		logger.Error(err)
+		return 1
+	}
+	if err := utils.Healthcheck(vars.AppServerPort); err != nil {
+		logger.Error(err)
+		return 1
+	}
 	return 0
 }

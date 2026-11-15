@@ -141,6 +141,20 @@ func TestFakeLLM(t *testing.T) {
 		require.JSONEq(t, `{"object":"list","data":[{"id":"qwen/qwen3-test","object":"model","created":0,"owned_by":"fakellm"}]}`, string(body))
 	})
 
+	t.Run("must_pass_health", func(t *testing.T) {
+		setup(t, Config{APIKey: "test-key"})
+
+		response, err := http.Get(server.URL + PathHealth)
+		require.NoError(t, err)
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, response.StatusCode)
+		require.Equal(t, "OK", string(body))
+		require.Empty(t, stub.Requests())
+	})
+
 	t.Run("must_pass_model_and_text", func(t *testing.T) {
 		setup(t, Config{Model: "qwen/qwen3-test", Text: "Справа дверь! Больше ничего."})
 

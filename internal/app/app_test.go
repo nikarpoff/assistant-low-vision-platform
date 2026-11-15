@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/env"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/fakellm"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/journal"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/logger"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/metrics"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/pipeline"
@@ -44,19 +46,62 @@ type gateway struct {
 	app      *App
 	http     *httptest.Server
 	detector *servicestub.Detector
+	asr      *servicestub.ASR
 	tts      *servicestub.TTS
 	llm      *fakellm.Server
+	records  *records
+	token    string
+}
+
+// records keeps the journal records of the gateway.
+type records struct {
+	mu   sync.Mutex
+	list []journal.Record
+}
+
+// Write keeps the record.
+func (r *records) Write(record journal.Record) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.list = append(r.list, record)
+}
+
+// all returns the records kept so far.
+func (r *records) all() []journal.Record {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]journal.Record(nil), r.list...)
+}
+
+// requests returns the request records kept so far.
+func (r *records) requests() []*journal.Request {
+	found := []*journal.Request{}
+	for _, record := range r.all() {
+		if request, ok := record.(*journal.Request); ok {
+			found = append(found, request)
+		}
+	}
+	return found
 }
 
 // newGateway starts the gateway from the environment, as cmd/gateway does.
 func newGateway(t *testing.T, environment map[string]string) *gateway {
 	t.Helper()
+	return newGatewayWith(t, environment, fakellm.Config{})
+}
+
+// newGatewayWith starts the gateway over the provider stub with the given settings.
+func newGatewayWith(t *testing.T, environment map[string]string, llmCfg fakellm.Config) *gateway {
+	t.Helper()
 	g := &gateway{
 		detector: servicestub.NewDetector(),
+		asr:      servicestub.NewASR(),
 		tts:      servicestub.NewTTS(),
-		llm:      fakellm.NewServer(fakellm.Config{}),
+		llm:      fakellm.NewServer(llmCfg),
+		records:  &records{},
 	}
 	t.Cleanup(g.detector.Close)
+	t.Cleanup(g.asr.Close)
 	t.Cleanup(g.tts.Close)
 	llmServer := httptest.NewServer(g.llm)
 	t.Cleanup(llmServer.Close)
@@ -68,7 +113,7 @@ func newGateway(t *testing.T, environment map[string]string) *gateway {
 		"APP_LLM_URL":        llmServer.URL + fakellm.BasePath,
 		"APP_LLM_MODEL":      testModel,
 		"APP_DETECTOR_URL":   g.detector.URL,
-		"APP_ASR_URL":        "http://127.0.0.1:1",
+		"APP_ASR_URL":        g.asr.URL,
 		"APP_TTS_URL":        g.tts.URL,
 	}
 	for name, value := range environment {
@@ -77,10 +122,11 @@ func newGateway(t *testing.T, environment map[string]string) *gateway {
 	for name, value := range defaults {
 		t.Setenv(name, value)
 	}
+	g.token = strings.Split(defaults["APP_DEVICE_TOKENS"], ",")[0]
 	vars, err := env.Load()
 	require.NoError(t, err)
 
-	g.app, err = NewApp(vars)
+	g.app, err = newApp(vars, g.records)
 	require.NoError(t, err)
 	require.NoError(t, g.app.Start(context.Background()))
 	t.Cleanup(g.app.Stop)
@@ -98,7 +144,7 @@ func newGateway(t *testing.T, environment map[string]string) *gateway {
 func (g *gateway) open(t *testing.T) *websocket.Conn {
 	t.Helper()
 	dialer := websocket.Dialer{Subprotocols: []string{session.Subprotocol}, HandshakeTimeout: testTimeout}
-	conn, _, err := dialer.Dial("ws"+strings.TrimPrefix(g.http.URL, "http")+session.Path, http.Header{"Authorization": {"Bearer " + testToken}})
+	conn, _, err := dialer.Dial("ws"+strings.TrimPrefix(g.http.URL, "http")+session.Path, http.Header{"Authorization": {"Bearer " + g.token}})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
 	require.NoError(t, conn.WriteMessage(websocket.TextMessage, []byte(testHello)))
@@ -222,7 +268,7 @@ func TestDescribePipeline(t *testing.T) {
 		require.LessOrEqual(t, end.Timings[pipeline.StageLLMTTFT], end.Timings[pipeline.StageLLMFirstSentence])
 
 		// The provider got the hazard first in the prompt and no identifiers (DSC-5, NFR-8)
-		recorded := g.llm.Requests()
+		recorded := completions(g.llm)
 		require.Len(t, recorded, 1)
 		body := string(recorded[0].Body)
 		var request struct {
@@ -260,7 +306,7 @@ func TestDescribePipeline(t *testing.T) {
 		require.True(t, end.Hazard)
 		require.NotContains(t, end.Timings, pipeline.StageLLMTTFT)
 		require.Contains(t, end.Timings, pipeline.StageServerTTFA)
-		require.Empty(t, g.llm.Requests())
+		require.Empty(t, completions(g.llm))
 	})
 
 	t.Run("must_pass_focus_ahead", func(t *testing.T) {
@@ -292,6 +338,17 @@ func TestDescribePipeline(t *testing.T) {
 		require.Equal(t, &protocol.Accepted{RequestID: id}, all[0].message)
 		require.Equal(t, &protocol.ErrorMessage{RequestID: &id, Code: protocol.CodeDetectorUnavailable, Message: "object detector unavailable", Retryable: true}, all[1].message)
 	})
+}
+
+// completions returns the chat completion requests the provider stub got; the /models checks are left out.
+func completions(stub *fakellm.Server) []fakellm.RecordedRequest {
+	found := []fakellm.RecordedRequest{}
+	for _, request := range stub.Requests() {
+		if request.Path == fakellm.PathChatCompletions {
+			found = append(found, request)
+		}
+	}
+	return found
 }
 
 // totalAudio returns the number of audio bytes of the frames.
