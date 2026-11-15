@@ -901,6 +901,25 @@ func TestLLMModels(t *testing.T) {
 		require.Equal(t, int32(1), dials.Load())
 	})
 
+	t.Run("must_pass_same_connection_after_late_stream_end", func(t *testing.T) {
+		// The end of the chunked body comes well after [DONE]: the stream is drained to it
+		var late http.Handler
+		setup(t, fakellm.Config{APIKey: testAPIKey}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			late.ServeHTTP(w, r)
+			if r.URL.Path != fakellm.PathModels {
+				w.(http.Flusher).Flush()
+				time.Sleep(50 * time.Millisecond)
+			}
+		}))
+		late = stub
+
+		_, err := client.Complete(context.Background(), &Request{RequestID: testRequestID, Model: testModel, Messages: []Message{{Role: RoleUser, Content: "?"}}}, func(string) error { return nil })
+		require.NoError(t, err)
+		require.NoError(t, client.Models(context.Background()))
+
+		require.Equal(t, int32(1), dials.Load())
+	})
+
 	t.Run("must_fail_status", func(t *testing.T) {
 		setup(t, fakellm.Config{APIKey: "other-key"}, nil)
 
