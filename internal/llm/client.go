@@ -43,6 +43,7 @@ const (
 // Request and header constants.
 const (
 	pathChatCompletions    = "/chat/completions"
+	pathModels             = "/models"
 	headerAuthorization    = "Authorization"
 	headerContentType      = "Content-Type"
 	headerAccept           = "Accept"
@@ -52,6 +53,7 @@ const (
 	upstreamLabel          = "llm"
 	finishReasonError      = "error"
 	maxErrorBodyBytes      = 64 << 10
+	maxModelsBodyBytes     = 4 << 20 // the list of a provider with hundreds of models
 )
 
 // Body fields the client sets itself. APP_LLM_EXTRA_BODY must not set them, nor
@@ -97,7 +99,12 @@ const (
 	logFailureFormat           = "language model request failed: request_id=%s reason=%s status=%d code=%s trace_id=%s"
 	logTransportFailureFormat  = "language model request failed: request_id=%s reason=%s status=%d error=%v"
 	logAnsweredFormat          = "language model answered: request_id=%s model=%s ttft_ms=%d duration_ms=%d stopped=%t"
+	errModelsStatusFormat      = "language model provider answered /models with status %d"
+	errModelsFormat            = "failed to get language model provider /models: %w"
 )
+
+// ModelsTimeout limits GET <APP_LLM_URL>/models: the check of the provider for /ready (PLT-13).
+const ModelsTimeout = 5 * time.Second
 
 // Causes of the timeouts of PLT-8, attached to the request context.
 var (
@@ -183,6 +190,7 @@ type Result struct {
 type Client struct {
 	httpClient     *http.Client
 	completionsURL string
+	modelsURL      string
 	apiKey         string
 	temperature    float64
 	seed           int
@@ -226,6 +234,7 @@ func NewClient(cfg Config, m *metrics.Metrics) (*Client, error) {
 	return &Client{
 		httpClient:     newHTTPClient(),
 		completionsURL: strings.TrimRight(cfg.URL, "/") + pathChatCompletions,
+		modelsURL:      strings.TrimRight(cfg.URL, "/") + pathModels,
 		apiKey:         cfg.APIKey,
 		temperature:    cfg.Temperature,
 		seed:           cfg.Seed,
@@ -295,6 +304,38 @@ func (c *Client) Complete(ctx context.Context, req *Request, onText TextHandler)
 
 	logger.Debug(logAnsweredFormat, req.RequestID, s.result.Model, s.result.TTFT.Milliseconds(), s.result.Duration.Milliseconds(), s.result.Stopped)
 	return s.result, nil
+}
+
+// Models checks the provider with GET <APP_LLM_URL>/models and the key, within ModelsTimeout,
+// over the same keep-alive pool as Complete: called at start and on every configuration
+// refresh, it keeps the connection to the provider warm (PLT-15) and gives the llm state of
+// /ready (PLT-13). Any 2xx answer is a success; the list itself is not used. The failure is
+// not counted in alv_upstream_errors_total: its reasons are those of the chat completions.
+func (c *Client) Models(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, ModelsTimeout)
+	defer cancel()
+
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, c.modelsURL, nil)
+	if err != nil {
+		return fmt.Errorf(errModelsFormat, err)
+	}
+	httpRequest.Header.Set(headerAccept, contentTypeJSON)
+	if c.apiKey != "" {
+		httpRequest.Header.Set(headerAuthorization, bearerPrefix+c.apiKey)
+	}
+
+	response, err := c.httpClient.Do(httpRequest)
+	if err != nil {
+		return fmt.Errorf(errModelsFormat, err)
+	}
+	defer response.Body.Close()
+	// The body is read to the end, so the connection goes back to the pool
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxModelsBodyBytes))
+
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		return fmt.Errorf(errModelsFormat, fmt.Errorf(errModelsStatusFormat, response.StatusCode))
+	}
+	return nil
 }
 
 // requestBody builds the JSON body: the extra body plus the fields set by the client.

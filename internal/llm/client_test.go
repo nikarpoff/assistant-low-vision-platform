@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -838,4 +839,84 @@ func errorHandler(status int, code string) http.HandlerFunc {
 		w.WriteHeader(status)
 		_, _ = fmt.Fprintf(w, `{"error":{"code":%q,"message":"Ошибка поставщика"},"trace_id":%q}`, code, testTraceID)
 	}
+}
+
+func TestLLMModels(t *testing.T) {
+	var (
+		m      *metrics.Metrics
+		client *Client
+		stub   *fakellm.Server
+		server *httptest.Server
+		dials  atomic.Int32
+	)
+
+	setup := func(t *testing.T, stubCfg fakellm.Config, handler http.Handler) {
+		logger.InitTestLogger()
+		m = metrics.NewMetrics()
+		stub = fakellm.NewServer(stubCfg)
+		if handler == nil {
+			handler = stub
+		}
+		dials.Store(0)
+		server = httptest.NewUnstartedServer(handler)
+		server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+			if state == http.StateNew {
+				dials.Add(1)
+			}
+		}
+		server.Start()
+		t.Cleanup(server.Close)
+
+		var err error
+		client, err = NewClient(Config{
+			URL:          server.URL + fakellm.BasePath + "/",
+			APIKey:       testAPIKey,
+			TTFTTimeout:  900 * time.Millisecond,
+			TotalTimeout: 5 * time.Second,
+		}, m)
+		require.NoError(t, err)
+	}
+
+	t.Run("must_pass", func(t *testing.T) {
+		setup(t, fakellm.Config{APIKey: testAPIKey}, nil)
+
+		require.NoError(t, client.Models(context.Background()))
+
+		recorded := stub.Requests()
+		require.Len(t, recorded, 1)
+		require.Equal(t, http.MethodGet, recorded[0].Method)
+		require.Equal(t, fakellm.PathModels, recorded[0].Path)
+		require.Equal(t, "Bearer "+testAPIKey, recorded[0].Header.Get(headerAuthorization))
+		require.Empty(t, recorded[0].Header.Get("X-Request-ID"))
+	})
+
+	t.Run("must_pass_same_connection_as_completions", func(t *testing.T) {
+		setup(t, fakellm.Config{APIKey: testAPIKey}, nil)
+
+		require.NoError(t, client.Models(context.Background()))
+		_, err := client.Complete(context.Background(), &Request{RequestID: testRequestID, Model: testModel, Messages: []Message{{Role: RoleUser, Content: "?"}}}, func(string) error { return nil })
+		require.NoError(t, err)
+		require.NoError(t, client.Models(context.Background()))
+
+		require.Equal(t, int32(1), dials.Load())
+	})
+
+	t.Run("must_fail_status", func(t *testing.T) {
+		setup(t, fakellm.Config{APIKey: "other-key"}, nil)
+
+		err := client.Models(context.Background())
+
+		require.EqualError(t, err, fmt.Errorf(errModelsFormat, fmt.Errorf(errModelsStatusFormat, http.StatusUnauthorized)).Error())
+		require.Zero(t, testutil.CollectAndCount(m.UpstreamErrors))
+	})
+
+	t.Run("must_fail_unavailable", func(t *testing.T) {
+		setup(t, fakellm.Config{}, nil)
+		server.Close()
+
+		err := client.Models(context.Background())
+
+		require.ErrorContains(t, err, "failed to get language model provider /models: ")
+		require.NotContains(t, err.Error(), testAPIKey)
+	})
 }
