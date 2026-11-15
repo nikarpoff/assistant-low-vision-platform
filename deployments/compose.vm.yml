@@ -98,6 +98,13 @@ services:
       APP_JOURNAL_BUFFER: ${APP_JOURNAL_BUFFER:-1024}
       APP_CONFIG_REFRESH_S: ${APP_CONFIG_REFRESH_S:-60}
     # Not published: Caddy reaches the gateway inside alv-net
+    # The distroless image has no shell and curl: the binary checks its own /health (DEP-7)
+    healthcheck:
+      test: ["CMD", "/gateway", "-healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   postgres:
     image: postgres:17.11-alpine

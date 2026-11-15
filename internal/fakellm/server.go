@@ -31,6 +31,9 @@ const (
 	PathModels          = BasePath + "/models"
 )
 
+// PathHealth is the liveness route of the stub: 200 OK, not recorded and without the key.
+const PathHealth = "/health"
+
 // Values of the stream and of the errors.
 const (
 	// DefaultModel is the model in the chunks and in /v1/models unless FAKELLM_MODEL sets another one.
@@ -128,6 +131,12 @@ func NewServer(cfg Config) *Server {
 
 // ServeHTTP records the request and serves it.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == PathHealth && r.Method == http.MethodGet {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+		return
+	}
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, CodeBadRequest, msgInvalidBody)
