@@ -1,6 +1,8 @@
 // Package app assembles the whole gateway from the configuration: the clients of
 // the model services and of the language model provider, the vocabulary, the
-// hazard rules, the describer, the pipelines, the sessions and the HTTP server.
+// hazard rules, the describer, the pipelines, the sessions, the journal, the
+// configuration snapshot and the HTTP server with /health, /ready, /metrics,
+// /v1/session, /v1/stats and /v1/config.
 // cmd/gateway only runs it, and the integration tests run the real gateway in-process.
 package app
 
@@ -17,6 +19,9 @@ import (
 	"github.com/nikarpoff/assistant-low-vision-platform/endpoints/httpserver"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/describer"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/env"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/handlers/confighandler"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/handlers/readyhandler"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/handlers/statshandler"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/hazard"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/history"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/intent"
@@ -28,6 +33,7 @@ import (
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/protocol"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/session"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/snapshot"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/stats"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/upstream/asr"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/upstream/detector"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/upstream/tts"
@@ -57,6 +63,10 @@ type App struct {
 	intents   *intent.Matcher
 	history   *history.Store
 	collector *snapshot.Collector
+	journal   *journal.Writer
+	repo      *journal.Repository
+	recorder  *journalRecorder
+	provider  *providerProbe
 	loader    *vocabulary.Loader
 	pipelines *readyPipelines
 	sessions  *session.Server
@@ -68,12 +78,23 @@ type App struct {
 	stopOnce sync.Once
 }
 
+// recorder takes the records of the journal.
+type recorder interface {
+	Write(record journal.Record)
+}
+
 // NewApp checks the configuration files and creates the gateway. Nothing is called yet: Start does it.
 func NewApp(vars *env.Vars) (*App, error) {
+	return newApp(vars, nil)
+}
+
+// newApp creates the gateway; observer, if not nil, gets a copy of every journal record (tests).
+func newApp(vars *env.Vars, observer recorder) (*App, error) {
 	a := &App{
-		vars:    vars,
-		metrics: metrics.NewMetrics(),
-		ready:   make(chan struct{}),
+		vars:     vars,
+		metrics:  metrics.NewMetrics(),
+		provider: &providerProbe{},
+		ready:    make(chan struct{}),
 	}
 
 	var err error
@@ -92,6 +113,7 @@ func NewApp(vars *env.Vars) (*App, error) {
 		if a.llm, err = llm.NewClient(llm.NewConfig(vars), a.metrics); err != nil {
 			return nil, fmt.Errorf(errBuildFormat, err)
 		}
+		a.provider = newProviderProbe(a.llm)
 		if a.prompt, err = describer.LoadPrompt(vars.AppPrompt); err != nil {
 			return nil, fmt.Errorf(errBuildFormat, err)
 		}
@@ -118,28 +140,52 @@ func NewApp(vars *env.Vars) (*App, error) {
 		return nil, fmt.Errorf(errBuildFormat, err)
 	}
 
+	if a.journal, a.repo, err = journal.Open(vars, a.metrics.JournalDropped); err != nil {
+		return nil, fmt.Errorf(errBuildFormat, err)
+	}
+	a.recorder = &journalRecorder{writer: a.journal, observer: observer}
+
 	a.loader = vocabulary.NewLoader(a.detector, vocabulary.DefaultInitialPause, vocabulary.DefaultMaxPause)
 	a.pipelines = &readyPipelines{metrics: a.metrics}
-	a.sessions = session.NewServer(session.NewConfig(vars, Version), a.pipelines, a.collector, a.metrics)
-	a.http = httpserver.NewServer(vars, a.sessions)
+	a.sessions = session.NewServer(session.NewConfig(vars, Version), a.pipelines, a.collector, a.recorder, a.metrics)
+
+	ready := readyhandler.NewHandler(readyhandler.Dependencies{
+		Detector:         a.detector,
+		ASR:              a.asr,
+		TTS:              a.tts,
+		LLM:              a.provider,
+		Journal:          a.journal,
+		Vocabulary:       a.loader,
+		DetectorRequired: vars.AppDescriberMode != env.DescriberModeVLM,
+	})
+	a.http = httpserver.NewServer(vars, httpserver.Handlers{
+		Sessions: a.sessions,
+		Ready:    http.HandlerFunc(ready.GetReady),
+		Metrics:  a.metrics.Handler(),
+		Stats:    http.HandlerFunc(statshandler.NewHandler(stats.NewService(a.repo)).GetStats),
+		Config:   http.HandlerFunc(confighandler.NewHandler(a.collector).GetConfig),
+	})
 
 	return a, nil
 }
 
-// Start collects the first configuration snapshot, then loads the vocabulary of the
-// detector in the background (PLT-16) and refreshes the snapshot every
-// APP_CONFIG_REFRESH_S (PLT-12). The pipelines work once the vocabulary is loaded.
+// Start starts the journal writer and collects the first configuration snapshot, then
+// in the background loads the vocabulary of the detector (PLT-16), checks the provider
+// and every APP_CONFIG_REFRESH_S refreshes the snapshot and checks the provider again
+// (PLT-12, PLT-13, PLT-15). Every snapshot goes to the journal. The pipelines work once
+// the vocabulary is loaded.
 func (a *App) Start(ctx context.Context) error {
 	ctx, a.cancel = context.WithCancel(ctx)
+	a.journal.Start()
 
-	if _, err := a.collector.Refresh(ctx); err != nil {
+	if err := a.refreshSnapshot(ctx); err != nil {
 		return err
 	}
 
 	a.wg.Add(2)
 	go func() {
 		defer a.wg.Done()
-		a.collector.Run(ctx)
+		a.refresh(ctx)
 	}()
 	go func() {
 		defer a.wg.Done()
@@ -158,7 +204,8 @@ func (a *App) Run() error {
 }
 
 // Stop closes the sessions as PLT-1 requires (no new ones, up to 5 s for the active
-// requests, then the code 1001), stops the HTTP server and the background work.
+// requests, then the code 1001), stops the HTTP server and the background work, then
+// writes the buffered journal records and closes the journal.
 func (a *App) Stop() {
 	a.stopOnce.Do(func() {
 		a.sessions.Shutdown(context.Background())
@@ -167,7 +214,44 @@ func (a *App) Stop() {
 			a.cancel()
 		}
 		a.wg.Wait()
+		a.journal.Stop()
+		a.repo.Close()
 	})
+}
+
+// refresh checks the provider, then every APP_CONFIG_REFRESH_S refreshes the snapshot and
+// checks the provider again until ctx is done.
+func (a *App) refresh(ctx context.Context) {
+	a.provider.check(ctx)
+
+	ticker := time.NewTicker(time.Duration(a.vars.AppConfigRefreshS) * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := a.refreshSnapshot(ctx); err != nil {
+				logger.Error(err)
+			}
+			a.provider.check(ctx)
+		}
+	}
+}
+
+// refreshSnapshot collects the configuration snapshot and saves it in the journal (PLT-11, PLT-12).
+func (a *App) refreshSnapshot(ctx context.Context) error {
+	current, err := a.collector.Refresh(ctx)
+	if err != nil {
+		return err
+	}
+	a.recorder.Write(&journal.ConfigSnapshot{
+		ConfigID:    current.ConfigID,
+		Config:      current.Config,
+		CollectedAt: current.CollectedAt,
+	})
+	return nil
 }
 
 // Handler returns the HTTP handler of the gateway.
@@ -213,7 +297,7 @@ func (a *App) buildPipelines(ctx context.Context) error {
 		Describer:   sceneDescriber,
 		History:     a.history,
 		Policy:      policy,
-		Recorder:    discardRecorder{},
+		Recorder:    a.recorder,
 		Config:      a.collector,
 		Metrics:     a.metrics,
 	}))
@@ -222,11 +306,67 @@ func (a *App) buildPipelines(ctx context.Context) error {
 	return nil
 }
 
-// discardRecorder is the journal until it is connected: the records are dropped.
-type discardRecorder struct{}
+// journalRecorder gives the records to the journal writer and, in the tests, to the observer.
+type journalRecorder struct {
+	writer   *journal.Writer
+	observer recorder
+}
 
-// Write drops the record.
-func (discardRecorder) Write(journal.Record) {}
+// Write puts the record in the journal buffer without waiting.
+func (r *journalRecorder) Write(record journal.Record) {
+	r.writer.Write(record)
+	if r.observer != nil {
+		r.observer.Write(record)
+	}
+}
+
+// providerProbe keeps the result of the last GET <APP_LLM_URL>/models: the llm state of /ready
+// (PLT-13). The checks also keep the connection to the provider warm (PLT-15).
+type providerProbe struct {
+	client *llm.Client // nil in the template mode
+	state  atomic.Value
+}
+
+func newProviderProbe(client *llm.Client) *providerProbe {
+	return &providerProbe{client: client}
+}
+
+// State returns "ok" or "down" by the last check ("down" before the first one), "disabled" in the template mode.
+func (p *providerProbe) State() string {
+	if p.client == nil {
+		return journal.StateDisabled
+	}
+	if state, ok := p.state.Load().(string); ok {
+		return state
+	}
+	return journal.StateDown
+}
+
+// check asks the provider for /models; a change of the state is logged.
+func (p *providerProbe) check(ctx context.Context) {
+	if p.client == nil {
+		return
+	}
+
+	state := journal.StateOK
+	err := p.client.Models(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		state = journal.StateDown
+	}
+
+	previous := p.state.Swap(state)
+	switch {
+	case err != nil && previous != state:
+		logger.Warning("language model provider is down: error=%v", err)
+	case err != nil:
+		logger.Debug("language model provider is still down: error=%v", err)
+	case previous != state:
+		logger.Info("Language model provider is up")
+	}
+}
 
 // readyPipelines runs the requests once the pipelines are built; until then a request
 // gets the error busy (the vocabulary of the detector is not loaded, PLT-16).
