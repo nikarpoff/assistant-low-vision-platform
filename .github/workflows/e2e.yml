@@ -1,0 +1,56 @@
+name: e2e
+
+# End-to-end check of the whole chain on stubs (DEP-8, AC-3): the gateway and the
+# model services are built from source and run on the fake backends with cmd/fakellm.
+on:
+  push:
+    branches: [dev]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      services_ref:
+        description: Branch of objects-detector, asr-service and tts-service
+        default: dev
+
+permissions:
+  contents: read
+
+jobs:
+  e2e-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      SERVICES_REF: ${{ inputs.services_ref || 'dev' }}
+    steps:
+      # The layout of the umbrella project: compose.local-build.yml builds the
+      # services from the sibling directories of the gateway repository
+      - uses: actions/checkout@v4
+        with:
+          path: assistant-low-vision-platform
+
+      - uses: actions/checkout@v4
+        with:
+          repository: nikarpoff/objects-detector
+          ref: ${{ env.SERVICES_REF }}
+          path: objects-detector
+          token: ${{ secrets.ALV_REPOS_TOKEN || github.token }}
+
+      - uses: actions/checkout@v4
+        with:
+          repository: nikarpoff/asr-service
+          ref: ${{ env.SERVICES_REF }}
+          path: asr-service
+          token: ${{ secrets.ALV_REPOS_TOKEN || github.token }}
+
+      - uses: actions/checkout@v4
+        with:
+          repository: nikarpoff/tts-service
+          ref: ${{ env.SERVICES_REF }}
+          path: tts-service
+          token: ${{ secrets.ALV_REPOS_TOKEN || github.token }}
+
+      - name: End-to-end check
+        working-directory: assistant-low-vision-platform
+        env:
+          ALV_LOCAL_BUILD: "1"
+        run: ./deployments/e2e-smoke.sh
