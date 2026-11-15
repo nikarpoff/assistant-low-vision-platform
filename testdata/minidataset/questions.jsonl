@@ -1,0 +1,2 @@
+{"id": "q001", "audio": "questions/q001.wav", "text": "где дверь", "condition": "quiet", "image_id": 3}
+{"id": "q002", "audio": "questions/q002.wav", "text": "где стул", "condition": "street_noise", "image_id": 2}

@@ -533,6 +533,41 @@ APP_LLM_API_KEY=... go run ./cmd/llmbench --url https://polza.ai/api/v1 --model 
 - Код выхода: `0` - все запросы удачны; `1` - хотя бы один запрос (в том числе прогревочный) завершился отказом или пустым ответом, или замер не запустился (нет модели, промпта, снимок не JPEG); `2` - неверные флаги. При отказах JSON всё равно печатается.
 - Логи клиента выключены: stdout отдан под JSON.
 
+## Имитатор приложений `cmd/loadgen`
+
+Нагрузочный прогон и замер E2E по настоящему протоколу `alv.v1` (PLT-19): `loadgen` открывает сессии WS или WSS с подпротоколом `alv.v1` и токеном устройства, говорит `hello` и гоняет манифест набора данных EXP-1 в сценариях `describe` (описание по касанию: `mode=on_demand`, `focus=all`), `ask` (вопрос: `ask.start` с `trigger=hold`, снимок вопроса, если у него есть `image_id`, кадры AUDIO_IN по 100 мс, `ask.end`) и `passive` (`describe` с `mode=passive`, `focus=ahead`). Один прогон - полный проход манифеста: `describe` каждого снимка, `ask` каждого вопроса, `passive` каждого снимка. Сессии берут запросы из общей очереди по одному, между запросами сессии - пауза. Каждый прогон открывает свои сессии, поэтому смена `config_id` между прогонами видна в `welcome`. `client.metrics` не отправляется: E2E в `/v1/stats` - только с телефонов, время `loadgen` - в его JSONL.
+
+```bash
+go run ./cmd/loadgen --url ws://127.0.0.1:8080/v1/session --token <токен устройства> \
+  --runs 3 --first-run 1 --sessions 1 --pause-ms 500 --out requests.jsonl --summary summary.json
+```
+
+| Флаг | Описание | По умолчанию |
+|---|---|---|
+| `--url` | Адрес `/v1/session`, `ws://` или `wss://` (TLS проверяется по системным корневым сертификатам) | `ws://127.0.0.1:8080/v1/session` |
+| `--token` | Токен устройства; пусто - без `Authorization` (`APP_AUTH_DISABLED=true`) | `$LOADGEN_TOKEN` |
+| `--dataset` | Каталог набора EXP-1: `annotations.json`, `images/`, `questions.jsonl`, `questions/` | `testdata/minidataset` |
+| `--scenarios` | Сценарии через запятую: `describe`, `ask`, `passive` | все три |
+| `--sessions` | Число одновременных сессий | `1` |
+| `--pause-ms` | Пауза между запросами сессии, мс | `0` |
+| `--runs` | Число прогонов | `1` |
+| `--first-run` | Номер первого прогона: прогоны, запущенные отдельно в разное время, нумеруются без совпадений | `1` |
+| `--warmup` | Прогревочные `describe` до первого прогона в отдельной сессии, в JSONL и сводку не входят | `5` |
+| `--timeout-ms` | Предел запроса от отправки входа до последнего сообщения, мс | `30000` |
+| `--describer-mode` | `APP_DESCRIBER_MODE` Шлюза (`template`, `llm`, `vlm`): `llm_fallback_share` считается только для `llm` и `vlm` | `llm` |
+| `--out` | Файл JSONL по запросам (обязательный) | нет |
+| `--summary` | Файл сводки; пусто - stdout | пусто |
+| `--strict` | Код выхода 1, если есть ошибки или ответ с текстом без аудио или без `timings` (сквозная проверка DEP-8) | выключен |
+
+- Строка JSONL - один запрос: `run` (номер прогона с учётом `--first-run`), `kind`, `image_id`, `question_id`, `request_id`, `config_id` (из `welcome` сессии), `sent_at` (UTC, момент отправки входа: сообщение `describe` или `ask.end` - конец речи, триггер вопроса по PLT-14), `accepted_ms`, `first_audio_ms`, `end_ms` (от `sent_at` до `accepted`, первого кадра AUDIO_OUT и `answer.end`, `passive.clear` или `error`; `null`, если не было), `timings` Шлюза, `text`, `intent`, `status` (`ok`, `degraded`, `error`, `clear`, `skipped`, `stale` - как в журнале), `degraded`, `degraded_reason`, `error_code` (код PROTO-11, `loadgen_timeout` или `loadgen_connection`), `audio_bytes`. JSONL с текстами ответов вне мини-набора не коммитится (NFR-8).
+- Сводка - JSON с ключами `config_ids` (все `config_id` в порядке появления), `sessions`, `pause_ms`, `runs`, `pooled`, `spread`, `llm_fallback_share_limit` (0.1), `llm_fallback_share_ok`. У каждого элемента `runs` - `run`, `started_at`, `finished_at` (UTC), `requests` (число по видам), `errors` (число по кодам), `first_audio` (время до первого аудио) и `stages` (этапы `timings`) - `n`, `p50`, `p95`, `mean`; `degraded` - `n` и `share` (доля от ответов `answer.end`) по каждому `degraded_reason`; `llm_fallback_share`. `pooled` - то же по объединению прогонов (без `run`), `spread` - `p50_min`, `p50_max`, `p95_min`, `p95_max` по прогонам для `first_audio` и каждого этапа.
+- Перцентили, средние и `llm_fallback_share` считает пакет `internal/stats` - так же, как `/v1/stats`. `llm_fallback_share_ok` - проверка объединения прогонов, `fallbacks*100 <= 10*answers`; без ответов описания сцены (режим `template`) доля и проверка - `null`.
+- Код выхода: `0`; `1` - набор не читается, прогрев не смог подключиться, прогон прерван или не прошла проверка `--strict`; `2` - неверные флаги. Сводка печатается и при ошибках запросов.
+
+### Встроенный мини-набор
+
+`testdata/minidataset/` - набор в формате EXP-1 для тестов и сквозной проверки: 5 снимков 640 пикселей по длинной стороне (3 в помещении, 2 на улице), 2 вопроса WAV PCM 16 кГц моно (`quiet` и `street_noise`), разметка COCO с атрибутами `direction` и `distance` и эталонные описания. Снимки подобраны так, что детектор на бэкенде `fake` даёт на них все три свои сцены: `img001.jpg` - ступени впереди (предупреждение пассивного режима), `img002.jpg` и `img003.jpg` - комната без опасностей (`passive.clear`), `img004.jpg` и `img005.jpg` - улица. Источники и лицензии (CC0, CC BY, общественное достояние) - в `testdata/minidataset/SOURCES.md`. `testdata/llmbench/scene.jpg` - копия `img002.jpg` без людей для живой проверки режима `vlm`.
+
 ## Развёртывание
 
 Файлы compose для вариантов размещения A и B и стенда на заглушках, Caddy с TLS, примеры туннеля WireGuard, прокси gpt2giga с сертификатом НУЦ, загрузка весов и живая проверка поставщиков - в [deployments/README.md](deployments/README.md).
@@ -611,6 +646,8 @@ cmd/gateway/main.go               # точка входа: логгер, кон�
 cmd/fakellm/main.go               # заглушка поставщика языковой модели для тестов и сквозной проверки
 cmd/llmbench/main.go              # замер поставщика языковой модели (LLM-4)
 endpoints/httpserver/             # HTTP-сервер, регистрация маршрутов, админ-токен и обезличенный 500
+cmd/loadgen/main.go               # имитатор приложений: прогоны набора по протоколу alv.v1, JSONL и сводка
+endpoints/httpserver/             # HTTP-сервер и регистрация маршрутов
 internal/env/                     # переменные окружения (Vars) и проверки при старте
 internal/logger/                  # printf-логгер: строки "<LEVEL>: <message>"
 internal/metrics/                 # метрики Prometheus в собственном реестре
@@ -624,6 +661,7 @@ internal/snapshot/                # снимок конфигурации сте
 internal/llm/                     # клиент языковой модели: SSE, виды отказов, таймауты
 internal/fakellm/                 # заглушка поставщика: поток в формате Polza.ai, режимы отказа, запись запросов
 internal/llmbench/                # замер поставщика: эталонный промпт, TTFT, первое предложение, JSON EXP-2
+internal/loadgen/                 # имитатор приложений: набор EXP-1, сессии, прогоны, JSONL, сводка
 internal/textnorm/                # нормализация текста PLT-4 и ASR-4
 internal/intent/                  # намерения: фразы команд, «пожалуйста», question
 internal/hazard/                  # правила опасности, фразы предупреждений, cooldown
@@ -647,7 +685,8 @@ prompts/                          # встроенные шаблоны пром
 testdata/contracts/               # эталонные контракты сервисов ИИ-моделей
 testdata/protocol/                # вектора протокола alv.v1
 testdata/stats/                   # эталон ответа /v1/stats (пример PLT-13)
-testdata/llmbench/                # эталонный промпт llmbench
+testdata/llmbench/                # эталонный промпт llmbench и снимок scene.jpg для режима vlm
+testdata/minidataset/             # встроенный мини-набор EXP-1: 5 снимков, 2 вопроса, разметка, источники
 build/Dockerfile                  # сборка образа (distroless)
 deployments/                      # развёртывание всей системы: compose, Caddy, WireGuard, сертификат НУЦ, скрипты (deployments/README.md)
 .github/workflows/                # CI и публикация образа
