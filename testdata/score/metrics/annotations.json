@@ -1,0 +1,210 @@
+{
+  "images": [
+    {
+      "id": 1,
+      "file_name": "images/img001.jpg",
+      "width": 640,
+      "height": 480,
+      "scene": "indoor"
+    },
+    {
+      "id": 2,
+      "file_name": "images/img002.jpg",
+      "width": 640,
+      "height": 480,
+      "scene": "indoor"
+    },
+    {
+      "id": 3,
+      "file_name": "images/img003.jpg",
+      "width": 640,
+      "height": 480,
+      "scene": "outdoor"
+    }
+  ],
+  "categories": [
+    {
+      "id": 1,
+      "name": "door"
+    },
+    {
+      "id": 2,
+      "name": "table"
+    },
+    {
+      "id": 3,
+      "name": "window"
+    },
+    {
+      "id": 4,
+      "name": "chair"
+    },
+    {
+      "id": 5,
+      "name": "car"
+    },
+    {
+      "id": 6,
+      "name": "crosswalk"
+    },
+    {
+      "id": 7,
+      "name": "person"
+    }
+  ],
+  "annotations": [
+    {
+      "id": 1,
+      "image_id": 1,
+      "category_id": 1,
+      "bbox": [
+        0,
+        0,
+        100,
+        100
+      ],
+      "area": 10000,
+      "iscrowd": 0,
+      "attributes": {
+        "direction": "right",
+        "distance": "near"
+      }
+    },
+    {
+      "id": 2,
+      "image_id": 1,
+      "category_id": 2,
+      "bbox": [
+        0,
+        0,
+        100,
+        100
+      ],
+      "area": 10000,
+      "iscrowd": 0,
+      "attributes": {
+        "direction": "ahead",
+        "distance": "near"
+      }
+    },
+    {
+      "id": 3,
+      "image_id": 1,
+      "category_id": 3,
+      "bbox": [
+        0,
+        0,
+        100,
+        100
+      ],
+      "area": 10000,
+      "iscrowd": 0,
+      "attributes": {
+        "direction": "left",
+        "distance": "near"
+      }
+    },
+    {
+      "id": 4,
+      "image_id": 2,
+      "category_id": 4,
+      "bbox": [
+        0,
+        0,
+        100,
+        100
+      ],
+      "area": 10000,
+      "iscrowd": 0,
+      "attributes": {
+        "direction": "ahead",
+        "distance": "near"
+      }
+    },
+    {
+      "id": 5,
+      "image_id": 2,
+      "category_id": 4,
+      "bbox": [
+        0,
+        0,
+        100,
+        100
+      ],
+      "area": 10000,
+      "iscrowd": 0,
+      "attributes": {
+        "direction": "left",
+        "distance": "near"
+      }
+    },
+    {
+      "id": 6,
+      "image_id": 2,
+      "category_id": 3,
+      "bbox": [
+        0,
+        0,
+        100,
+        100
+      ],
+      "area": 10000,
+      "iscrowd": 0,
+      "attributes": {
+        "direction": "right",
+        "distance": "near"
+      }
+    },
+    {
+      "id": 7,
+      "image_id": 3,
+      "category_id": 5,
+      "bbox": [
+        0,
+        0,
+        100,
+        100
+      ],
+      "area": 10000,
+      "iscrowd": 0,
+      "attributes": {
+        "direction": "right",
+        "distance": "near"
+      }
+    },
+    {
+      "id": 8,
+      "image_id": 3,
+      "category_id": 6,
+      "bbox": [
+        0,
+        0,
+        100,
+        100
+      ],
+      "area": 10000,
+      "iscrowd": 0,
+      "attributes": {
+        "direction": "ahead",
+        "distance": "near"
+      }
+    },
+    {
+      "id": 9,
+      "image_id": 3,
+      "category_id": 7,
+      "bbox": [
+        0,
+        0,
+        100,
+        100
+      ],
+      "area": 10000,
+      "iscrowd": 0,
+      "attributes": {
+        "direction": "ahead",
+        "distance": "near"
+      }
+    }
+  ]
+}
