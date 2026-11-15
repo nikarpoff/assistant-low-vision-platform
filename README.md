@@ -568,6 +568,40 @@ go run ./cmd/loadgen --url ws://127.0.0.1:8080/v1/session --token <токен у
 
 `testdata/minidataset/` - набор в формате EXP-1 для тестов и сквозной проверки: 5 снимков 640 пикселей по длинной стороне (3 в помещении, 2 на улице), 2 вопроса WAV PCM 16 кГц моно (`quiet` и `street_noise`), разметка COCO с атрибутами `direction` и `distance` и эталонные описания. Снимки подобраны так, что детектор на бэкенде `fake` даёт на них все три свои сцены: `img001.jpg` - ступени впереди (предупреждение пассивного режима), `img002.jpg` и `img003.jpg` - комната без опасностей (`passive.clear`), `img004.jpg` и `img005.jpg` - улица. Источники и лицензии (CC0, CC BY, общественное достояние) - в `testdata/minidataset/SOURCES.md`. `testdata/llmbench/scene.jpg` - копия `img002.jpg` без людей для живой проверки режима `vlm`.
 
+## Оценка ответов `cmd/score`
+
+Оценка текстов ответов `loadgen` по разметке набора (PLT-19, EXP-4) и вердикт по гипотезе (EXP-8). Вход - один или несколько файлов JSONL `loadgen` (например, по файлу на прогон), результат - JSON в stdout или в файл `--out`, диагностика - в stderr.
+
+```bash
+go run ./cmd/score --dataset <каталог набора> --vocabulary vocabulary.json \
+  --stats stats.json run1.jsonl run2.jsonl run3.jsonl > score.json
+```
+
+| Флаг | Описание | По умолчанию |
+|---|---|---|
+| `--dataset` | Каталог набора EXP-1: `descriptions.jsonl` с ключевыми объектами (обязательный) и `annotations.json` COCO со сценами и всеми размеченными объектами | `testdata/minidataset` |
+| `--vocabulary` | Словарь детектора - сохранённый ответ `GET /v1/vocabulary` детектора стенда: шаблоны упоминаний `mentions` и признак `key` | `testdata/contracts/objects-detector/vocabulary.response.json` |
+| `--stats` | Сохранённый ответ `GET /v1/stats?config_id=...` за время прогонов: добавляет блок `hypothesis` | нет |
+| `--out` | Файл результата; пусто - stdout | пусто |
+
+- Прогоны различаются по полю `run`. Один номер прогона в двух файлах - ошибка: прогоны, запущенные отдельно, нумеруются через `loadgen --first-run`.
+- Оцениваются ответы описания по касанию (`kind=describe`) со статусом `ok` или `degraded`: только они описывают всю сцену. Запросы `describe` без `answer.end` (ошибка, таймаут) считаются в `unanswered` и не оцениваются; `ask` и `passive` пропускаются.
+- Текст режется на предложения после `.`, `!`, `?`, `…` перед пробелом или в конце текста и нормализуется по PLT-4. Упоминание класса - совпадение с шаблоном `mentions` словаря целыми словами. Направления: `left` - «слева», «налево», «левее», «по левую руку», «с левой стороны»; `ahead` - «впереди», «спереди», «прямо», «перед вами», «перед тобой»; `right` - «справа», «направо», «правее», «по правую руку», «с правой стороны».
+- Метрики EXP-4:
+  - `key_objects_with_direction` - ключевой объект назван верно, если в одном предложении упомянут его класс и названо его направление; сумма верно названных делится на сумму ключевых объектов (микроусреднение). Два объекта одного класса считаются по отдельности;
+  - `key_objects_class_only` - то же без направления: класс упомянут где-либо в ответе;
+  - `hallucinated` - упоминание - пара «предложение, ключевой класс» (`key: true` в словаре); выдуманное - класса нет ни в `annotations.json` снимка, ни в его ключевых объектах; число выдуманных делится на все упоминания.
+- Ключи результата: `config_ids`, `files`, `runs` (по прогонам, с `run`), `pooled` (объединение прогонов), `spread` (`min`, `max`, `mean` каждой доли по прогонам), `images` (по снимкам за все прогоны, с `image_id` и `scene`), с `--stats` - `hypothesis`. У итогов - счётчики `answers`, `unanswered`, `key_objects`, `named_with_direction`, `named_class_only`, `mentions`, `hallucinated_mentions` и доли `key_objects_with_direction`, `key_objects_class_only`, `hallucinated` (`null` без знаменателя).
+- Блок `hypothesis` (EXP-8): `config_id`, `runs`, `e2e_p95_ms` (p95 `e2e.describe` из `/v1/stats`, `null` без замеров), `e2e_p95_limit_ms` (2000), `key_objects_with_direction` (объединение прогонов), `key_objects_limit` (0.75), `llm_fallback_share` (из `/v1/stats`), `llm_fallback_share_limit` (0.1), `checks` (`e2e`, `quality`, `fallbacks`; `null` для отсутствующей величины), `verdict`:
+  - `confirmed` - выполнены все три условия не меньше чем на трёх прогонах;
+  - `not_confirmed` - хотя бы одна проверка не выполнена (даже если другой величины нет);
+  - `insufficient_data` - ни одна проверка не провалена, но какой-то величины нет или прогонов меньше трёх.
+
+  Границы включены, сравнения целочисленные: `named_with_direction*100 >= 75*key_objects`; p95 и доля откатов переводятся в миллионные доли единицы с округлением и сравниваются с порогом как целые. `config_id` блока - из `/v1/stats`; если в JSONL есть другой `config_id`, это ошибка. Без `config_id` в `/v1/stats` берётся единственный `config_id` JSONL.
+- Автоматическая оценка перепроверяется вручную на 10 % ответов (EXP-4).
+- Код выхода: `0` - результат напечатан (при любом вердикте); `1` - вход не читается или противоречив (повтор номера прогона, снимок без описания, класс не из словаря, чужой `config_id`); `2` - неверные флаги или нет файлов JSONL.
+- Игрушечные данные тестов - `testdata/score/`: `metrics/` (3 снимка, два прогона в двух файлах и файл с повтором прогона) и `verdict/` (20 снимков по одному ключевому объекту, `quality90`, `quality75`, `quality74.jsonl` по 5 прогонов и сохранённые ответы `/v1/stats` для случаев вердикта).
+
 ## Развёртывание
 
 Файлы compose для вариантов размещения A и B и стенда на заглушках, Caddy с TLS, примеры туннеля WireGuard, прокси gpt2giga с сертификатом НУЦ, загрузка весов и живая проверка поставщиков - в [deployments/README.md](deployments/README.md).
@@ -647,6 +681,7 @@ cmd/fakellm/main.go               # заглушка поставщика язы
 cmd/llmbench/main.go              # замер поставщика языковой модели (LLM-4)
 endpoints/httpserver/             # HTTP-сервер, регистрация маршрутов, админ-токен и обезличенный 500
 cmd/loadgen/main.go               # имитатор приложений: прогоны набора по протоколу alv.v1, JSONL и сводка
+cmd/score/main.go                 # оценка ответов по разметке набора (EXP-4) и вердикт по гипотезе (EXP-8)
 endpoints/httpserver/             # HTTP-сервер и регистрация маршрутов
 internal/env/                     # переменные окружения (Vars) и проверки при старте
 internal/logger/                  # printf-логгер: строки "<LEVEL>: <message>"
@@ -662,6 +697,7 @@ internal/llm/                     # клиент языковой модели: 
 internal/fakellm/                 # заглушка поставщика: поток в формате Polza.ai, режимы отказа, запись запросов
 internal/llmbench/                # замер поставщика: эталонный промпт, TTFT, первое предложение, JSON EXP-2
 internal/loadgen/                 # имитатор приложений: набор EXP-1, сессии, прогоны, JSONL, сводка
+internal/score/                   # оценка ответов: ключевые объекты, направления, выдуманные объекты, вердикт EXP-8
 internal/textnorm/                # нормализация текста PLT-4 и ASR-4
 internal/intent/                  # намерения: фразы команд, «пожалуйста», question
 internal/hazard/                  # правила опасности, фразы предупреждений, cooldown
@@ -687,6 +723,7 @@ testdata/protocol/                # вектора протокола alv.v1
 testdata/stats/                   # эталон ответа /v1/stats (пример PLT-13)
 testdata/llmbench/                # эталонный промпт llmbench и снимок scene.jpg для режима vlm
 testdata/minidataset/             # встроенный мини-набор EXP-1: 5 снимков, 2 вопроса, разметка, источники
+testdata/score/                   # игрушечные данные score: разметка, JSONL loadgen, ответы /v1/stats
 build/Dockerfile                  # сборка образа (distroless)
 deployments/                      # развёртывание всей системы: compose, Caddy, WireGuard, сертификат НУЦ, скрипты (deployments/README.md)
 .github/workflows/                # CI и публикация образа
