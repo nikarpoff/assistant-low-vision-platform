@@ -818,3 +818,86 @@ alv_e2e_duration_seconds_count{kind="describe",network="wifi"} 1
 		require.NotContains(t, s.kinds, first)
 	})
 }
+
+func TestSession_PassiveJournal(t *testing.T) {
+	var (
+		h *harness
+	)
+
+	setup := func() {
+		logger.InitTestLogger()
+		h = newHarness(t, nil)
+	}
+
+	// passive sends a passive describe and its snapshot.
+	passive := func(t *testing.T, c *client, id uuid.UUID) {
+		t.Helper()
+		c.send(t, fmt.Sprintf(`{"type":"describe","request_id":"%s","mode":"passive","focus":"ahead","image":{"width":640,"height":480,"bytes":%d}}`, id, len(testImage)))
+		c.sendFrame(t, protocol.EncodeFrame(&protocol.Frame{Kind: protocol.KindImageJPEG, RequestID: id, Payload: testImage}))
+	}
+
+	// last reads until the last message of the passive request: passive.clear, answer.end or error.
+	last := func(t *testing.T, c *client, id uuid.UUID) protocol.Message {
+		t.Helper()
+		for {
+			switch m := c.next(t).message.(type) {
+			case *protocol.PassiveClear:
+				if m.RequestID == id {
+					return m
+				}
+			case *protocol.AnswerEnd:
+				if m.RequestID == id {
+					return m
+				}
+			case *protocol.ErrorMessage:
+				if m.RequestID != nil && *m.RequestID == id {
+					return m
+				}
+			}
+		}
+	}
+
+	t.Run("must_pass_skipped_journaled", func(t *testing.T) {
+		setup()
+		c := h.open(t)
+		// A question in progress: the passive request is skipped by the session
+		question := uuid.New()
+		c.send(t, fmt.Sprintf(`{"type":"ask.start","request_id":"%s","trigger":"hold","with_image":false}`, question))
+		id := uuid.New()
+		passive(t, c, id)
+
+		require.Equal(t, &protocol.PassiveClear{RequestID: id, Reason: protocol.ClearSkipped}, c.next(t).message)
+		var record *journal.Request
+		require.Eventually(t, func() bool {
+			for _, call := range h.recorder.WriteCalls() {
+				if r, ok := call.Record.(*journal.Request); ok && r.RequestID == id.String() {
+					record = r
+					return true
+				}
+			}
+			return false
+		}, testTimeout, 10*time.Millisecond)
+		require.Equal(t, pipeline.KindPassive, record.Kind)
+		require.Equal(t, pipeline.StatusSkipped, record.Status)
+		require.Equal(t, string(env.DescriberModeTemplate), record.DescriberMode)
+		require.Equal(t, testConfigID, record.ConfigID)
+		require.NotEmpty(t, record.SessionID)
+		require.Equal(t, time.UTC, record.CreatedAt.Location())
+		require.Equal(t, 1.0, testutil.ToFloat64(h.metrics.Requests.WithLabelValues(pipeline.KindPassive, pipeline.StatusSkipped)))
+	})
+
+	t.Run("must_pass_back_to_back_not_skipped", func(t *testing.T) {
+		setup()
+		c := h.open(t)
+		// The next passive request goes right after the last message of the previous one
+		for i := 0; i < 50; i++ {
+			id := uuid.New()
+			passive(t, c, id)
+			got := last(t, c, id)
+			if clear, ok := got.(*protocol.PassiveClear); ok {
+				require.NotEqual(t, protocol.ClearSkipped, clear.Reason, "request %d is skipped", i)
+			}
+			require.IsNotType(t, &protocol.ErrorMessage{}, got, "request %d failed", i)
+		}
+	})
+}
