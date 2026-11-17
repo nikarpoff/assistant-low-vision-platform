@@ -898,6 +898,30 @@ func TestSession_PassiveJournal(t *testing.T) {
 	})
 }
 
+func TestSession_Ignored(t *testing.T) {
+	var (
+		s *Session
+	)
+
+	setup := func() {
+		s = newSession(nil, nil)
+	}
+
+	t.Run("must_pass_bounded", func(t *testing.T) {
+		setup()
+		ids := make([]uuid.UUID, maxIgnored+1)
+		for i := range ids {
+			ids[i] = uuid.New()
+			s.ignore(ids[i])
+		}
+
+		require.Len(t, s.ignored, maxIgnored)
+		require.Len(t, s.ignoredOrder, maxIgnored)
+		require.False(t, s.ignored[ids[0]])
+		require.True(t, s.ignored[ids[maxIgnored]])
+	})
+}
+
 func TestSession_RequestJournal(t *testing.T) {
 	var (
 		h *harness
