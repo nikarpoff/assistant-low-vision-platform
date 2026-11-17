@@ -67,6 +67,11 @@ var ErrCancelled = errors.New("request cancelled")
 // after it and records the status error.
 var ErrRejected = errors.New("request rejected")
 
+// ErrSessionClosed is the cancellation cause of the requests of a closed session: the
+// connection is lost or the gateway shuts down (PLT-1). Like ErrCancelled, the pipeline
+// sends nothing after it and records the status cancelled, not an error.
+var ErrSessionClosed = errors.New("session closed")
+
 //go:generate moq -out sink_moq_test.go . Sink
 
 // Sink takes the messages and the AUDIO_OUT frames of one request in their order.
@@ -265,6 +270,12 @@ func (p *Pipeline) detection(r *run, detected *detector.DetectResponse, err erro
 	}
 	r.fail(protocol.NewError(protocol.CodeDetectorUnavailable, errDetectorUnavailable), err)
 	return nil, false
+}
+
+// isCancellation reports whether the cause ends a request as cancelled: by the
+// application or by the close of its session.
+func isCancellation(cause error) bool {
+	return errors.Is(cause, ErrCancelled) || errors.Is(cause, ErrSessionClosed)
 }
 
 // run is the state of one request in a pipeline.
@@ -562,7 +573,7 @@ func (r *run) answerStarted() bool {
 
 // cancelled reports whether the application cancelled the request.
 func (r *run) cancelled() bool {
-	return errors.Is(context.Cause(r.ctx), ErrCancelled)
+	return isCancellation(context.Cause(r.ctx))
 }
 
 // isStale reports whether the passive answer got stale before answer.start.
@@ -592,8 +603,10 @@ func (p *Pipeline) llmTimings(r *run, result *llm.Result) {
 func (p *Pipeline) finish(r *run) {
 	switch {
 	case r.cancelled():
+		// A failure seen after the cancellation, e.g. of the detector call it broke, is not an error
 		r.status = StatusCancelled
-		logger.Info("request cancelled: request_id=%s kind=%s", r.id, r.kind)
+		r.errorCode = ""
+		logger.Info("request cancelled: request_id=%s kind=%s cause=%v", r.id, r.kind, context.Cause(r.ctx))
 	case r.rejected():
 		r.status = StatusError
 	}

@@ -31,11 +31,8 @@ const (
 	msgUnsupportedProtocol  = "unsupported protocol version"
 )
 
-// Causes of the end of a request context other than pipeline.ErrCancelled.
-var (
-	errRequestDone   = errors.New("request done")
-	errSessionClosed = errors.New("session closed")
-)
+// errRequestDone is the cause of the end of a request context when its pipeline returns.
+var errRequestDone = errors.New("request done")
 
 // outboundSize is the room of the write queue of a session.
 const outboundSize = 256
@@ -82,6 +79,7 @@ type request struct {
 	end          chan pipeline.AskEnd
 	audio        []byte
 	ended        bool
+	settled      bool // rejected or dropped by the session: counted and recorded once
 }
 
 // dropped reports whether the application cancelled the request or the session rejected
@@ -97,7 +95,7 @@ type Session struct {
 	server *Server
 	conn   *websocket.Conn
 	ctx    context.Context
-	cancel context.CancelFunc
+	cancel context.CancelCauseFunc // the cause is pipeline.ErrSessionClosed
 
 	out       chan outbound
 	closed    chan struct{}
@@ -116,7 +114,7 @@ type Session struct {
 }
 
 func newSession(server *Server, conn *websocket.Conn) *Session {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancelCause(context.Background())
 	return &Session{
 		id:      uuid.New(),
 		server:  server,
@@ -153,15 +151,18 @@ func (s *Session) run() {
 		}
 	}
 
-	s.close()
+	// The requests end as cancelled by the close, then the session context goes. The
+	// session may be closed already (shutdown, a failed write, no pong): drop still
+	// counts and records a request without a pipeline.
 	s.mu.Lock()
 	for _, r := range []*request{s.user, s.passive} {
 		if r != nil {
-			s.drop(r, errSessionClosed)
+			s.drop(r, pipeline.ErrSessionClosed)
 		}
 	}
 	s.user, s.passive = nil, nil
 	s.mu.Unlock()
+	s.close()
 	s.waitRequests()
 	if s.hello != nil {
 		s.server.recorder.Write(&journal.SessionEnd{SessionID: s.id.String(), EndedAt: time.Now().UTC()})
@@ -186,7 +187,8 @@ func (s *Session) waitRequests() {
 func (s *Session) close() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
-		s.cancel()
+		// The running pipelines see the cause and end as cancelled, not failed
+		s.cancel(pipeline.ErrSessionClosed)
 		_ = s.conn.Close()
 	})
 }
@@ -652,6 +654,10 @@ func (s *Session) release(r *request) {
 // reject ends the request with an error before or instead of its pipeline.
 func (s *Session) reject(r *request, err error) {
 	s.release(r)
+	if r.settled {
+		return
+	}
+	r.settled = true
 
 	running := r.running
 	// The pipeline takes the error code of the journal from the cause
@@ -674,9 +680,12 @@ func (s *Session) cancelUser() {
 // drop ends the request with the cause. A request whose pipeline is not running yet is
 // counted and recorded here; a running pipeline counts and records itself.
 func (s *Session) drop(r *request, cause error) {
-	if r.ctx.Err() != nil {
+	// Not r.ctx.Err(): the context of a request ends with its session too, and the
+	// request must still be recorded
+	if r.settled {
 		return
 	}
+	r.settled = true
 	r.cancel(cause)
 	if !r.running {
 		s.server.metrics.Requests.WithLabelValues(r.kind, pipeline.StatusCancelled).Inc()
