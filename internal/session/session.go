@@ -51,6 +51,10 @@ const (
 // comes after the request is over and does not name its kind (alv_e2e_duration_seconds{kind}).
 const recentKinds = 64
 
+// maxIgnored is how many skipped passive requests a session waits the snapshot of;
+// the oldest is forgotten, so an application that never sends it costs no memory.
+const maxIgnored = 64
+
 // readLimitSlack is what a frame may exceed the snapshot limit by and still get
 // payload_too_large instead of closing the connection.
 const readLimitSlack = 1 << 20
@@ -102,11 +106,12 @@ type Session struct {
 	closeOnce sync.Once
 	active    atomic.Int32 // requests whose pipeline is running
 
-	// hello, ignored, kinds and kindOrder belong to the reader goroutine.
-	hello     *protocol.Hello
-	ignored   map[uuid.UUID]bool // skipped passive requests whose snapshot is still to come
-	kinds     map[uuid.UUID]string
-	kindOrder []uuid.UUID // the oldest first, at most recentKinds
+	// hello, ignored, ignoredOrder, kinds and kindOrder belong to the reader goroutine.
+	hello        *protocol.Hello
+	ignored      map[uuid.UUID]bool // skipped passive requests whose snapshot is still to come
+	ignoredOrder []uuid.UUID        // the oldest first, at most maxIgnored
+	kinds        map[uuid.UUID]string
+	kindOrder    []uuid.UUID // the oldest first, at most recentKinds
 
 	mu      sync.Mutex
 	user    *request // describe on_demand or ask
@@ -406,7 +411,7 @@ func (s *Session) onPassive(m *protocol.Describe) {
 	s.mu.Unlock()
 
 	if busy {
-		s.ignored[m.RequestID] = true
+		s.ignore(m.RequestID)
 		s.server.metrics.Requests.WithLabelValues(pipeline.KindPassive, pipeline.StatusSkipped).Inc()
 		s.record(m.RequestID, pipeline.KindPassive, time.Now(), pipeline.StatusSkipped, "")
 		s.send(nil, &protocol.PassiveClear{RequestID: m.RequestID, Reason: protocol.ClearSkipped})
@@ -649,6 +654,17 @@ func (s *Session) release(r *request) {
 	if s.passive == r {
 		s.passive = nil
 	}
+}
+
+// ignore remembers a skipped passive request, so its snapshot is dropped silently; the
+// oldest is forgotten beyond maxIgnored.
+func (s *Session) ignore(id uuid.UUID) {
+	if len(s.ignoredOrder) == maxIgnored {
+		delete(s.ignored, s.ignoredOrder[0])
+		s.ignoredOrder = s.ignoredOrder[1:]
+	}
+	s.ignored[id] = true
+	s.ignoredOrder = append(s.ignoredOrder, id)
 }
 
 // reject ends the request with an error before or instead of its pipeline.
