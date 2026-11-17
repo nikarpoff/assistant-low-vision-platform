@@ -1010,37 +1010,7 @@ func TestSession_RequestJournal(t *testing.T) {
 		c.send(t, fmt.Sprintf(`{"type":"cancel","request_id":"%s"}`, question))
 		requireRecord(t, question, pipeline.KindAsk, pipeline.StatusCancelled, "")
 
-		// The session closes while a request waits for its snapshot and a question for ask.end
-		closedDescribe, closedAsk := uuid.New(), uuid.New()
-		describeWaiting(t, closedDescribe)
-		c.send(t, fmt.Sprintf(`{"type":"ask.start","request_id":"%s","trigger":"hold","with_image":false}`, closedAsk))
-		_ = c.next(t) // answer of the replacing request, so both messages are read by the session
-		require.NoError(t, c.conn.Close())
-		requireRecord(t, closedAsk, pipeline.KindAsk, pipeline.StatusCancelled, "")
-		requireRecord(t, closedDescribe, pipeline.KindDescribe, pipeline.StatusCancelled, "")
-
-		// The records of the requests come before the end of the session
-		require.Eventually(t, func() bool {
-			for _, call := range h.recorder.WriteCalls() {
-				if _, ok := call.Record.(*journal.SessionEnd); ok {
-					return true
-				}
-			}
-			return false
-		}, testTimeout, 10*time.Millisecond)
-		order := []string{}
-		for _, call := range h.recorder.WriteCalls() {
-			switch r := call.Record.(type) {
-			case *journal.Request:
-				if r.RequestID == closedDescribe.String() || r.RequestID == closedAsk.String() {
-					order = append(order, "request")
-				}
-			case *journal.SessionEnd:
-				order = append(order, "session_end")
-			}
-		}
-		require.Equal(t, []string{"request", "request", "session_end"}, order)
-		for _, id := range []uuid.UUID{cancelled, replaced, question, closedDescribe, closedAsk} {
+		for _, id := range []uuid.UUID{cancelled, replaced, question} {
 			require.Equal(t, 1, count(id))
 		}
 	})
@@ -1068,5 +1038,138 @@ func TestSession_RequestJournal(t *testing.T) {
 		}
 		require.Equal(t, []string{"request", "session_end"}, records)
 		require.Zero(t, h.server.Sessions())
+	})
+}
+
+func TestSession_CloseJournal(t *testing.T) {
+	var (
+		h       *harness
+		c       *client
+		getLogs func() string
+	)
+
+	setup := func(grace time.Duration) {
+		getLogs = logger.InitTestLogger()
+		h = newHarness(t, func(cfg *Config) { cfg.ShutdownGrace = grace })
+		c = h.open(t)
+	}
+
+	// session returns the only session of the server.
+	session := func(t *testing.T) *Session {
+		t.Helper()
+		h.server.registry.mu.Lock()
+		defer h.server.registry.mu.Unlock()
+		require.Len(t, h.server.registry.sessions, 1)
+		for _, s := range h.server.registry.sessions {
+			return s
+		}
+		return nil
+	}
+
+	// requireCancelled checks that the request ended by the close of the session has
+	// exactly one journal record, cancelled without an error code, before the end of the
+	// session, and is counted as cancelled, not as an error.
+	requireCancelled := func(t *testing.T, id uuid.UUID, kind string) {
+		t.Helper()
+		ended := func() bool {
+			for _, call := range h.recorder.WriteCalls() {
+				if _, ok := call.Record.(*journal.SessionEnd); ok {
+					return true
+				}
+			}
+			return false
+		}
+		require.Eventually(t, ended, testTimeout, 10*time.Millisecond)
+
+		order := []string{}
+		var record *journal.Request
+		for _, call := range h.recorder.WriteCalls() {
+			switch r := call.Record.(type) {
+			case *journal.Request:
+				if r.RequestID == id.String() {
+					record = r
+					order = append(order, "request")
+				}
+			case *journal.SessionEnd:
+				order = append(order, "session_end")
+			}
+		}
+		require.Equal(t, []string{"request", "session_end"}, order)
+		require.Equal(t, kind, record.Kind)
+		require.Equal(t, pipeline.StatusCancelled, record.Status)
+		require.Empty(t, record.ErrorCode)
+		require.Equal(t, 1.0, testutil.ToFloat64(h.metrics.Requests.WithLabelValues(kind, pipeline.StatusCancelled)))
+		require.Zero(t, testutil.ToFloat64(h.metrics.Requests.WithLabelValues(kind, pipeline.StatusError)))
+		require.NotContains(t, getLogs(), "request failed")
+	}
+
+	t.Run("must_pass_waiting_snapshot_cancelled", func(t *testing.T) {
+		setup(DefaultShutdownGrace)
+		id := uuid.New()
+		c.send(t, fmt.Sprintf(`{"type":"describe","request_id":"%s","mode":"on_demand","focus":"all","image":{"width":640,"height":480,"bytes":13}}`, id))
+		s := session(t)
+		require.Eventually(t, func() bool { return s.find(id) != nil }, testTimeout, time.Millisecond)
+
+		// The connection is lost while the request waits for its snapshot
+		require.NoError(t, c.conn.Close())
+
+		requireCancelled(t, id, pipeline.KindDescribe)
+	})
+
+	t.Run("must_pass_detecting_cancelled", func(t *testing.T) {
+		setup(DefaultShutdownGrace)
+		h.detector.Hold(true)
+		id := uuid.New()
+		c.describe(t, id, testImage)
+		<-h.detector.Arrived()
+
+		// The connection is lost while the detector works on the snapshot
+		require.NoError(t, c.conn.Close())
+
+		requireCancelled(t, id, pipeline.KindDescribe)
+	})
+
+	t.Run("must_pass_question_cancelled", func(t *testing.T) {
+		setup(DefaultShutdownGrace)
+		id := uuid.New()
+		c.send(t, fmt.Sprintf(`{"type":"ask.start","request_id":"%s","trigger":"hold","with_image":false}`, id))
+		require.Eventually(t, func() bool { return h.server.registry.activeRequests() == 1 }, testTimeout, time.Millisecond)
+
+		// The connection is lost before ask.end
+		require.NoError(t, c.conn.Close())
+
+		requireCancelled(t, id, pipeline.KindAsk)
+	})
+
+	t.Run("must_pass_shutdown_cancelled", func(t *testing.T) {
+		setup(0)
+		h.detector.Hold(true)
+		detecting, waiting := uuid.New(), uuid.New()
+		// A passive request waits for its snapshot, a user request is in the detector
+		c.send(t, fmt.Sprintf(`{"type":"describe","request_id":"%s","mode":"passive","focus":"ahead","image":{"width":640,"height":480,"bytes":13}}`, waiting))
+		s := session(t)
+		require.Eventually(t, func() bool { return s.find(waiting) != nil }, testTimeout, time.Millisecond)
+		c.describe(t, detecting, testImage)
+		<-h.detector.Arrived()
+
+		// The gateway stops (SIGTERM): the grace period is over at once
+		h.server.Shutdown(context.Background())
+
+		requireCancelledShutdown := func(id uuid.UUID, kind string) {
+			var record *journal.Request
+			for _, call := range h.recorder.WriteCalls() {
+				if r, ok := call.Record.(*journal.Request); ok && r.RequestID == id.String() {
+					require.Nil(t, record, "one record of %s", id)
+					record = r
+				}
+			}
+			require.NotNil(t, record)
+			require.Equal(t, pipeline.StatusCancelled, record.Status)
+			require.Empty(t, record.ErrorCode)
+			require.Zero(t, testutil.ToFloat64(h.metrics.Requests.WithLabelValues(kind, pipeline.StatusError)))
+		}
+		requireCancelledShutdown(detecting, pipeline.KindDescribe)
+		requireCancelledShutdown(waiting, pipeline.KindPassive)
+		require.NotContains(t, getLogs(), "request failed")
 	})
 }
