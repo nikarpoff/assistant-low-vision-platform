@@ -31,11 +31,8 @@ const (
 	msgUnsupportedProtocol  = "unsupported protocol version"
 )
 
-// Causes of the end of a request context other than pipeline.ErrCancelled.
-var (
-	errRequestDone   = errors.New("request done")
-	errSessionClosed = errors.New("session closed")
-)
+// errRequestDone is the cause of the end of a request context when its pipeline returns.
+var errRequestDone = errors.New("request done")
 
 // outboundSize is the room of the write queue of a session.
 const outboundSize = 256
@@ -53,6 +50,10 @@ const (
 // recentKinds is how many request kinds a session remembers for client.metrics, which
 // comes after the request is over and does not name its kind (alv_e2e_duration_seconds{kind}).
 const recentKinds = 64
+
+// maxIgnored is how many skipped passive requests a session waits the snapshot of;
+// the oldest is forgotten, so an application that never sends it costs no memory.
+const maxIgnored = 64
 
 // readLimitSlack is what a frame may exceed the snapshot limit by and still get
 // payload_too_large instead of closing the connection.
@@ -82,6 +83,7 @@ type request struct {
 	end          chan pipeline.AskEnd
 	audio        []byte
 	ended        bool
+	settled      bool // rejected or dropped by the session: counted and recorded once
 }
 
 // dropped reports whether the application cancelled the request or the session rejected
@@ -97,18 +99,19 @@ type Session struct {
 	server *Server
 	conn   *websocket.Conn
 	ctx    context.Context
-	cancel context.CancelFunc
+	cancel context.CancelCauseFunc // the cause is pipeline.ErrSessionClosed
 
 	out       chan outbound
 	closed    chan struct{}
 	closeOnce sync.Once
 	active    atomic.Int32 // requests whose pipeline is running
 
-	// hello, ignored, kinds and kindOrder belong to the reader goroutine.
-	hello     *protocol.Hello
-	ignored   map[uuid.UUID]bool // skipped passive requests whose snapshot is still to come
-	kinds     map[uuid.UUID]string
-	kindOrder []uuid.UUID // the oldest first, at most recentKinds
+	// hello, ignored, ignoredOrder, kinds and kindOrder belong to the reader goroutine.
+	hello        *protocol.Hello
+	ignored      map[uuid.UUID]bool // skipped passive requests whose snapshot is still to come
+	ignoredOrder []uuid.UUID        // the oldest first, at most maxIgnored
+	kinds        map[uuid.UUID]string
+	kindOrder    []uuid.UUID // the oldest first, at most recentKinds
 
 	mu      sync.Mutex
 	user    *request // describe on_demand or ask
@@ -116,7 +119,7 @@ type Session struct {
 }
 
 func newSession(server *Server, conn *websocket.Conn) *Session {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancelCause(context.Background())
 	return &Session{
 		id:      uuid.New(),
 		server:  server,
@@ -153,15 +156,18 @@ func (s *Session) run() {
 		}
 	}
 
-	s.close()
+	// The requests end as cancelled by the close, then the session context goes. The
+	// session may be closed already (shutdown, a failed write, no pong): drop still
+	// counts and records a request without a pipeline.
 	s.mu.Lock()
 	for _, r := range []*request{s.user, s.passive} {
 		if r != nil {
-			s.drop(r, errSessionClosed)
+			s.drop(r, pipeline.ErrSessionClosed)
 		}
 	}
 	s.user, s.passive = nil, nil
 	s.mu.Unlock()
+	s.close()
 	s.waitRequests()
 	if s.hello != nil {
 		s.server.recorder.Write(&journal.SessionEnd{SessionID: s.id.String(), EndedAt: time.Now().UTC()})
@@ -186,7 +192,8 @@ func (s *Session) waitRequests() {
 func (s *Session) close() {
 	s.closeOnce.Do(func() {
 		close(s.closed)
-		s.cancel()
+		// The running pipelines see the cause and end as cancelled, not failed
+		s.cancel(pipeline.ErrSessionClosed)
 		_ = s.conn.Close()
 	})
 }
@@ -404,7 +411,7 @@ func (s *Session) onPassive(m *protocol.Describe) {
 	s.mu.Unlock()
 
 	if busy {
-		s.ignored[m.RequestID] = true
+		s.ignore(m.RequestID)
 		s.server.metrics.Requests.WithLabelValues(pipeline.KindPassive, pipeline.StatusSkipped).Inc()
 		s.record(m.RequestID, pipeline.KindPassive, time.Now(), pipeline.StatusSkipped, "")
 		s.send(nil, &protocol.PassiveClear{RequestID: m.RequestID, Reason: protocol.ClearSkipped})
@@ -649,9 +656,24 @@ func (s *Session) release(r *request) {
 	}
 }
 
+// ignore remembers a skipped passive request, so its snapshot is dropped silently; the
+// oldest is forgotten beyond maxIgnored.
+func (s *Session) ignore(id uuid.UUID) {
+	if len(s.ignoredOrder) == maxIgnored {
+		delete(s.ignored, s.ignoredOrder[0])
+		s.ignoredOrder = s.ignoredOrder[1:]
+	}
+	s.ignored[id] = true
+	s.ignoredOrder = append(s.ignoredOrder, id)
+}
+
 // reject ends the request with an error before or instead of its pipeline.
 func (s *Session) reject(r *request, err error) {
 	s.release(r)
+	if r.settled {
+		return
+	}
+	r.settled = true
 
 	running := r.running
 	// The pipeline takes the error code of the journal from the cause
@@ -674,9 +696,12 @@ func (s *Session) cancelUser() {
 // drop ends the request with the cause. A request whose pipeline is not running yet is
 // counted and recorded here; a running pipeline counts and records itself.
 func (s *Session) drop(r *request, cause error) {
-	if r.ctx.Err() != nil {
+	// Not r.ctx.Err(): the context of a request ends with its session too, and the
+	// request must still be recorded
+	if r.settled {
 		return
 	}
+	r.settled = true
 	r.cancel(cause)
 	if !r.running {
 		s.server.metrics.Requests.WithLabelValues(r.kind, pipeline.StatusCancelled).Inc()

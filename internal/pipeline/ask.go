@@ -184,8 +184,8 @@ func (p *Pipeline) recognize(r *run, audio []byte) (string, bool) {
 }
 
 // endUnstarted counts and records a question that ended before ask.end: cancelled by
-// the application or the session, or rejected by the session with an error whose code
-// is in the cause (PLT-11).
+// the application or by the close of the session, or rejected by the session with an
+// error whose code is in the cause (PLT-11).
 func (p *Pipeline) endUnstarted(ctx context.Context, req *AskRequest) {
 	status, code := StatusCancelled, ""
 	if cause := context.Cause(ctx); errors.Is(cause, ErrRejected) {
