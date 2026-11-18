@@ -1,0 +1,14 @@
+# Not needed to build the image
+.git
+.github
+.worktrees
+docs
+
+# Generated mocks, local builds and test artifacts
+**/*_moq_test.go
+**/dev-*
+**/*.test
+**/*.out
+
+# Local secrets
+**/.env

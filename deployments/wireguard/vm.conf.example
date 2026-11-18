@@ -1,0 +1,18 @@
+# WireGuard on the VM (DEP-5): /etc/wireguard/wg0.conf, up with `wg-quick up wg0`
+# before compose. The VM has a public IP and only listens: the models machine is
+# behind NAT and starts the tunnel itself, so the peer below has no Endpoint.
+#
+# Keys: `wg genkey | tee vm.key | wg pubkey > vm.pub`; the private key stays on
+# this host and never goes to git.
+
+[Interface]
+# ALV_TUNNEL_VM_IP
+Address = 10.77.0.1/24
+ListenPort = 51820
+PrivateKey = <private key of the VM: contents of vm.key>
+
+[Peer]
+# Models machine
+PublicKey = <public key of the models machine: contents of models.pub>
+# ALV_TUNNEL_MODELS_IP
+AllowedIPs = 10.77.0.2/32

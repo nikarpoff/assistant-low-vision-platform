@@ -1,0 +1,9 @@
+[
+  {
+    "id": "xenia",
+    "backend": "silero",
+    "sample_rate": 48000,
+    "gender": "f",
+    "default": true
+  }
+]

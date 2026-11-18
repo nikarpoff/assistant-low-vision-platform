@@ -1,0 +1,7 @@
+{
+  "text": "Осторожно, впереди близко ступени.",
+  "voice": "xenia",
+  "sample_rate": 24000,
+  "format": "pcm_s16le",
+  "speed": 1.0
+}

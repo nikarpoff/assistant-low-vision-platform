@@ -1,0 +1,169 @@
+{
+  "cases": [
+    {
+      "name": "command_with_period",
+      "input": "Опиши.",
+      "expected": "опиши"
+    },
+    {
+      "name": "command_two_words",
+      "input": "Опиши обстановку!",
+      "expected": "опиши обстановку"
+    },
+    {
+      "name": "question_mark",
+      "input": "Что впереди?",
+      "expected": "что впереди"
+    },
+    {
+      "name": "yo_lowercase",
+      "input": "Ещё раз",
+      "expected": "еще раз"
+    },
+    {
+      "name": "yo_uppercase",
+      "input": "ЕЩЁ РАЗ!",
+      "expected": "еще раз"
+    },
+    {
+      "name": "upper_case",
+      "input": "ВЫКЛЮЧИ ПАССИВНЫЙ РЕЖИМ",
+      "expected": "выключи пассивный режим"
+    },
+    {
+      "name": "please_at_end",
+      "input": "Повтори, пожалуйста.",
+      "expected": "повтори пожалуйста"
+    },
+    {
+      "name": "please_at_start",
+      "input": "Пожалуйста, опиши",
+      "expected": "пожалуйста опиши"
+    },
+    {
+      "name": "please_both_commas",
+      "input": "Перестань следить, пожалуйста!",
+      "expected": "перестань следить пожалуйста"
+    },
+    {
+      "name": "question_where",
+      "input": "Где дверь?",
+      "expected": "где дверь"
+    },
+    {
+      "name": "question_people",
+      "input": "В комнате есть люди?",
+      "expected": "в комнате есть люди"
+    },
+    {
+      "name": "hyphen_inside_word",
+      "input": "Где-то есть дверь?",
+      "expected": "где то есть дверь"
+    },
+    {
+      "name": "hyphen_what",
+      "input": "Что-то впереди есть?",
+      "expected": "что то впереди есть"
+    },
+    {
+      "name": "em_dash",
+      "input": "Хватит — замолчи",
+      "expected": "хватит замолчи"
+    },
+    {
+      "name": "ellipsis_char",
+      "input": "Что ты видишь…",
+      "expected": "что ты видишь"
+    },
+    {
+      "name": "three_dots",
+      "input": "Не понял...",
+      "expected": "не понял"
+    },
+    {
+      "name": "repeated_marks",
+      "input": "Тихо!!!",
+      "expected": "тихо"
+    },
+    {
+      "name": "colon",
+      "input": "Скамейка: справа",
+      "expected": "скамейка справа"
+    },
+    {
+      "name": "semicolon",
+      "input": "Не следи; не следи",
+      "expected": "не следи не следи"
+    },
+    {
+      "name": "guillemets",
+      "input": "Скажи «стоп»",
+      "expected": "скажи стоп"
+    },
+    {
+      "name": "double_quotes",
+      "input": "Он сказал \"стоп\"",
+      "expected": "он сказал стоп"
+    },
+    {
+      "name": "parentheses_and_yo",
+      "input": "Ёлка (зелёная)",
+      "expected": "елка зеленая"
+    },
+    {
+      "name": "underscore",
+      "input": "Что_передо_мной",
+      "expected": "что передо мной"
+    },
+    {
+      "name": "digits_kept",
+      "input": "Где 3 стула?",
+      "expected": "где 3 стула"
+    },
+    {
+      "name": "symbol_kept",
+      "input": "Кабинет №5?",
+      "expected": "кабинет №5"
+    },
+    {
+      "name": "latin",
+      "input": "OK, Stop",
+      "expected": "ok stop"
+    },
+    {
+      "name": "outer_spaces",
+      "input": "  Стоп  ",
+      "expected": "стоп"
+    },
+    {
+      "name": "tab_and_spaces",
+      "input": "Включи   пассивный\tрежим",
+      "expected": "включи пассивный режим"
+    },
+    {
+      "name": "newline",
+      "input": "Что спереди?\n",
+      "expected": "что спереди"
+    },
+    {
+      "name": "no_break_space",
+      "input": "Дверь справа",
+      "expected": "дверь справа"
+    },
+    {
+      "name": "only_punctuation",
+      "input": "?!..",
+      "expected": ""
+    },
+    {
+      "name": "only_spaces",
+      "input": "   ",
+      "expected": ""
+    },
+    {
+      "name": "empty",
+      "input": "",
+      "expected": ""
+    }
+  ]
+}

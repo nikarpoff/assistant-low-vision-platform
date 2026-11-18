@@ -1,0 +1,1199 @@
+package session
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/require"
+
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/describer"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/env"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/hazard"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/history"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/journal"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/logger"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/metrics"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/pipeline"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/protocol"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/servicestub"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/snapshot"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/upstream/detector"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/upstream/tts"
+	"github.com/nikarpoff/assistant-low-vision-platform/internal/vocabulary"
+)
+
+// Settings of the tests.
+const (
+	testToken         = "device-token-1"
+	testConfigID      = "c9f2a1d0e3b4"
+	testVersion       = "0.1.0"
+	testMaxImageBytes = 64 << 10
+	testTimeout       = 5 * time.Second
+	testHello         = `{"type":"hello","protocol":1,"device_id":"5f0c3a52-8a0b-4d4e-9c61-3f1d2b7a9e10","app_version":"0.1.0","locale":"ru-RU","platform":"android-34","network":"wifi"}`
+)
+
+// testImage is a small fake JPEG snapshot.
+var testImage = []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0x00, 0xFF, 0xD9}
+
+// harness is a session server over a real pipeline in the template mode and the service stubs.
+type harness struct {
+	server   *Server
+	http     *httptest.Server
+	detector *servicestub.Detector
+	tts      *servicestub.TTS
+	metrics  *metrics.Metrics
+	recorder *RecorderMock
+	cfg      Config
+}
+
+func newHarness(t *testing.T, mutate func(cfg *Config)) *harness {
+	t.Helper()
+	h := &harness{detector: servicestub.NewDetector(), tts: servicestub.NewTTS(), metrics: metrics.NewMetrics()}
+	t.Cleanup(h.detector.Close)
+	t.Cleanup(h.tts.Close)
+
+	vars := &env.Vars{
+		AppDeviceTokens:           []string{"other-token", testToken},
+		AppDescriberMode:          env.DescriberModeTemplate,
+		AppDetectorURL:            h.detector.URL,
+		AppDetectTimeoutMS:        2000,
+		AppTTSURL:                 h.tts.URL,
+		AppTTSFirstChunkTimeoutMS: 2000,
+		AppMaxAnswerChars:         220,
+		AppRequestDeadlineMS:      8000,
+		AppImageMaxSide:           640,
+		AppJPEGQuality:            80,
+		AppPassiveIntervalMS:      3000,
+		AppListenWindowMS:         5000,
+		AppMaxQuestionMS:          15000,
+		AppAudioOutSampleRate:     24000,
+		AppMaxImageBytes:          testMaxImageBytes,
+	}
+	detectorClient, err := detector.NewClient(vars, h.metrics)
+	require.NoError(t, err)
+	ttsClient, err := tts.NewClient(vars, h.metrics)
+	require.NoError(t, err)
+
+	body, err := os.ReadFile(servicestub.ContractPath("objects-detector", "vocabulary.response.json"))
+	require.NoError(t, err)
+	document := &vocabulary.Document{}
+	require.NoError(t, json.Unmarshal(body, document))
+	vocab, err := vocabulary.NewVocabulary(document)
+	require.NoError(t, err)
+	rules, err := hazard.LoadRules("")
+	require.NoError(t, err)
+	policy, err := hazard.NewPolicy(rules, vocab)
+	require.NoError(t, err)
+	sceneDescriber, err := describer.NewDescriber(describer.NewConfig(vars), vocab, policy, nil, nil)
+	require.NoError(t, err)
+	store, err := history.NewStore(5, 6, time.Minute, time.Now)
+	require.NoError(t, err)
+	configSource := &ConfigSourceMock{CurrentFunc: func() *snapshot.Snapshot {
+		return &snapshot.Snapshot{ConfigID: testConfigID}
+	}}
+
+	// The session and the pipelines write to one journal, as in the gateway
+	h.recorder = &RecorderMock{WriteFunc: func(journal.Record) {}}
+	pipelines := pipeline.NewPipeline(pipeline.NewConfig(vars), pipeline.Dependencies{
+		Detector:    detectorClient,
+		Synthesizer: ttsClient,
+		Describer:   sceneDescriber,
+		History:     store,
+		Policy:      policy,
+		Recorder:    h.recorder,
+		Config:      configSource,
+		Metrics:     h.metrics,
+	})
+
+	h.cfg = NewConfig(vars, testVersion)
+	if mutate != nil {
+		mutate(&h.cfg)
+	}
+	h.server = NewServer(h.cfg, pipelines, configSource, h.recorder, h.metrics)
+	h.http = httptest.NewServer(h.server)
+	t.Cleanup(h.http.Close)
+	return h
+}
+
+// dial opens a session; token is empty for no Authorization header.
+func (h *harness) dial(token string, subprotocols ...string) (*client, *http.Response, error) {
+	header := http.Header{}
+	if token != "" {
+		header.Set("Authorization", "Bearer "+token)
+	}
+	dialer := websocket.Dialer{Subprotocols: subprotocols, EnableCompression: true, HandshakeTimeout: testTimeout}
+	conn, response, err := dialer.Dial("ws"+strings.TrimPrefix(h.http.URL, "http")+Path, header)
+	if err != nil {
+		return nil, response, err
+	}
+	return &client{conn: conn}, response, nil
+}
+
+// open opens a session with the device token and says hello.
+func (h *harness) open(t *testing.T) *client {
+	t.Helper()
+	c, _, err := h.dial(testToken, Subprotocol)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.conn.Close() })
+	c.send(t, testHello)
+	require.IsType(t, &protocol.Welcome{}, c.next(t).message)
+	return c
+}
+
+// client is the application side of a session.
+type client struct {
+	conn *websocket.Conn
+}
+
+// received is a message or a frame from the gateway.
+type received struct {
+	message protocol.Message
+	frame   *protocol.Frame
+}
+
+func (c *client) send(t *testing.T, message string) {
+	t.Helper()
+	require.NoError(t, c.conn.WriteMessage(websocket.TextMessage, []byte(message)))
+}
+
+func (c *client) sendFrame(t *testing.T, data []byte) {
+	t.Helper()
+	require.NoError(t, c.conn.WriteMessage(websocket.BinaryMessage, data))
+}
+
+// describe sends describe and its snapshot.
+func (c *client) describe(t *testing.T, id uuid.UUID, image []byte) {
+	t.Helper()
+	c.send(t, fmt.Sprintf(`{"type":"describe","request_id":"%s","mode":"on_demand","focus":"all","image":{"width":640,"height":480,"bytes":%d}}`, id, len(image)))
+	c.sendFrame(t, protocol.EncodeFrame(&protocol.Frame{Kind: protocol.KindImageJPEG, RequestID: id, Payload: image}))
+}
+
+// next reads the next message or frame from the gateway.
+func (c *client) next(t *testing.T) received {
+	t.Helper()
+	_ = c.conn.SetReadDeadline(time.Now().Add(testTimeout))
+	messageType, data, err := c.conn.ReadMessage()
+	require.NoError(t, err)
+	if messageType == websocket.BinaryMessage {
+		frame, err := protocol.DecodeFrame(data, protocol.NewFrameLimits(0))
+		require.NoError(t, err)
+		return received{frame: frame}
+	}
+	message, err := protocol.DecodeServerMessage(data)
+	require.NoError(t, err, string(data))
+	return received{message: message}
+}
+
+// nextError reads the next message and requires an error.
+func (c *client) nextError(t *testing.T) *protocol.ErrorMessage {
+	t.Helper()
+	got := c.next(t)
+	require.IsType(t, &protocol.ErrorMessage{}, got.message)
+	return got.message.(*protocol.ErrorMessage)
+}
+
+// until reads until answer.end or error of the request and returns everything read.
+func (c *client) until(t *testing.T, id uuid.UUID) []received {
+	t.Helper()
+	all := []received{}
+	for {
+		got := c.next(t)
+		all = append(all, got)
+		switch m := got.message.(type) {
+		case *protocol.AnswerEnd:
+			if m.RequestID == id {
+				return all
+			}
+		case *protocol.ErrorMessage:
+			if m.RequestID != nil && *m.RequestID == id {
+				return all
+			}
+		}
+	}
+}
+
+// requireOpen proves the session is open: a describe request gets accepted and answer.end.
+func (c *client) requireOpen(t *testing.T) {
+	t.Helper()
+	id := uuid.New()
+	c.describe(t, id, testImage)
+	all := c.until(t, id)
+	require.Equal(t, &protocol.Accepted{RequestID: id}, all[0].message)
+	require.IsType(t, &protocol.AnswerEnd{}, all[len(all)-1].message)
+}
+
+func TestSession_Handshake(t *testing.T) {
+	var (
+		h       *harness
+		getLogs func() string
+	)
+
+	setup := func(mutate func(cfg *Config)) {
+		getLogs = logger.InitTestLogger()
+		h = newHarness(t, mutate)
+	}
+
+	t.Run("must_pass_welcome", func(t *testing.T) {
+		setup(nil)
+
+		c, response, err := h.dial(testToken, Subprotocol)
+		require.NoError(t, err)
+		defer c.conn.Close()
+		c.send(t, testHello)
+		got := c.next(t)
+
+		require.Equal(t, Subprotocol, response.Header.Get("Sec-WebSocket-Protocol"))
+		require.Empty(t, response.Header.Get("Sec-WebSocket-Extensions"))
+		welcome := got.message.(*protocol.Welcome)
+		require.NotEqual(t, uuid.Nil, welcome.SessionID)
+		require.Equal(t, testVersion, welcome.ServerVersion)
+		require.Equal(t, testConfigID, welcome.ConfigID)
+		require.Equal(t, protocol.ClientConfig{
+			ImageMaxSide:      640,
+			JPEGQuality:       80,
+			PassiveIntervalMS: 3000,
+			ListenWindowMS:    5000,
+			MaxQuestionMS:     15000,
+			AudioIn:           protocol.AudioFormat{Format: "pcm_s16le", SampleRate: 16000, Channels: 1},
+			AudioOut:          protocol.AudioFormat{Format: "pcm_s16le", SampleRate: 24000, Channels: 1},
+		}, welcome.Config)
+		require.Equal(t, 1.0, testutil.ToFloat64(h.metrics.SessionsActive))
+		require.Equal(t, 1, h.server.Sessions())
+		require.Contains(t, getLogs(), "INFO: Session hello: session_id="+welcome.SessionID.String())
+		require.NotContains(t, getLogs(), testToken)
+
+		require.NoError(t, c.conn.Close())
+		require.Eventually(t, func() bool { return h.server.Sessions() == 0 }, testTimeout, 10*time.Millisecond)
+		require.Equal(t, 0.0, testutil.ToFloat64(h.metrics.SessionsActive))
+	})
+
+	t.Run("must_pass_auth_disabled", func(t *testing.T) {
+		setup(func(cfg *Config) { cfg.AuthDisabled = true })
+
+		c, response, err := h.dial("", Subprotocol)
+		require.NoError(t, err)
+		defer c.conn.Close()
+		c.send(t, testHello)
+		got := c.next(t)
+
+		require.Equal(t, http.StatusSwitchingProtocols, response.StatusCode)
+		require.Equal(t, testConfigID, got.message.(*protocol.Welcome).ConfigID)
+	})
+
+	t.Run("must_fail_no_token", func(t *testing.T) {
+		setup(nil)
+
+		_, response, err := h.dial("", Subprotocol)
+
+		require.ErrorIs(t, err, websocket.ErrBadHandshake)
+		require.Equal(t, http.StatusUnauthorized, response.StatusCode)
+		body, _ := io.ReadAll(response.Body)
+		require.JSONEq(t, `{"error":"unauthorized"}`, string(body))
+		require.Equal(t, 0, h.server.Sessions())
+	})
+
+	t.Run("must_fail_bad_token", func(t *testing.T) {
+		setup(nil)
+
+		_, response, err := h.dial("wrong-token", Subprotocol)
+
+		require.ErrorIs(t, err, websocket.ErrBadHandshake)
+		require.Equal(t, http.StatusUnauthorized, response.StatusCode)
+		require.Contains(t, getLogs(), "WARNING: unauthorized session request: remote=")
+		require.NotContains(t, getLogs(), "wrong-token")
+	})
+
+	t.Run("must_fail_no_subprotocol", func(t *testing.T) {
+		setup(nil)
+
+		_, response, err := h.dial(testToken, "alv.v2")
+
+		require.ErrorIs(t, err, websocket.ErrBadHandshake)
+		require.Equal(t, http.StatusBadRequest, response.StatusCode)
+		body, _ := io.ReadAll(response.Body)
+		require.JSONEq(t, `{"error":"`+msgSubprotocolRequired+`"}`, string(body))
+	})
+
+	t.Run("must_fail_unsupported_protocol", func(t *testing.T) {
+		setup(nil)
+		c, _, err := h.dial(testToken, Subprotocol)
+		require.NoError(t, err)
+		defer c.conn.Close()
+
+		c.send(t, strings.Replace(testHello, `"protocol":1`, `"protocol":2`, 1))
+		errorMessage := c.nextError(t)
+		_, _, readErr := c.conn.ReadMessage()
+
+		require.Equal(t, &protocol.ErrorMessage{Code: protocol.CodeUnsupportedProtocol, Message: "unsupported protocol version 2", Retryable: false}, errorMessage)
+		var closeErr *websocket.CloseError
+		require.True(t, errors.As(readErr, &closeErr), readErr)
+		require.Equal(t, CloseUnsupportedProtocol, closeErr.Code)
+	})
+}
+
+func TestSession_BadInput(t *testing.T) {
+	var (
+		h *harness
+		c *client
+	)
+
+	setup := func() {
+		logger.InitTestLogger()
+		h = newHarness(t, nil)
+		c = h.open(t)
+	}
+
+	t.Run("must_pass_short_frame", func(t *testing.T) {
+		setup()
+
+		c.sendFrame(t, []byte{0x01, 0x01, 0x12, 0x3e})
+		errorMessage := c.nextError(t)
+
+		require.Nil(t, errorMessage.RequestID)
+		require.Equal(t, protocol.CodeBadRequest, errorMessage.Code)
+		require.Equal(t, "frame is shorter than the 22-byte header: 4 bytes", errorMessage.Message)
+		require.False(t, errorMessage.Retryable)
+		c.requireOpen(t)
+	})
+
+	t.Run("must_pass_unknown_kind", func(t *testing.T) {
+		setup()
+		data := protocol.EncodeFrame(&protocol.Frame{Kind: protocol.KindImageJPEG, RequestID: uuid.New(), Payload: testImage})
+		data[1] = 0x05
+
+		c.sendFrame(t, data)
+		errorMessage := c.nextError(t)
+
+		require.Equal(t, protocol.CodeBadRequest, errorMessage.Code)
+		require.Equal(t, "unknown frame kind 0x05", errorMessage.Message)
+		c.requireOpen(t)
+	})
+
+	t.Run("must_pass_unknown_version", func(t *testing.T) {
+		setup()
+		data := protocol.EncodeFrame(&protocol.Frame{Kind: protocol.KindImageJPEG, RequestID: uuid.New(), Payload: testImage})
+		data[0] = 0x02
+
+		c.sendFrame(t, data)
+		errorMessage := c.nextError(t)
+
+		require.Equal(t, protocol.CodeBadRequest, errorMessage.Code)
+		require.Equal(t, "unknown frame version 0x02", errorMessage.Message)
+		c.requireOpen(t)
+	})
+
+	t.Run("must_pass_message_before_hello", func(t *testing.T) {
+		logger.InitTestLogger()
+		h = newHarness(t, nil)
+		var err error
+		c, _, err = h.dial(testToken, Subprotocol)
+		require.NoError(t, err)
+		defer c.conn.Close()
+
+		c.send(t, `{"type":"cancel","request_id":"123e4567-e89b-12d3-a456-426614174000"}`)
+		messageError := c.nextError(t)
+		c.sendFrame(t, protocol.EncodeFrame(&protocol.Frame{Kind: protocol.KindImageJPEG, RequestID: uuid.New(), Payload: testImage}))
+		frameError := c.nextError(t)
+		c.send(t, testHello)
+
+		require.Equal(t, &protocol.ErrorMessage{Code: protocol.CodeBadRequest, Message: errHelloExpected}, messageError)
+		require.Equal(t, &protocol.ErrorMessage{Code: protocol.CodeBadRequest, Message: errFrameBeforeHello}, frameError)
+		require.IsType(t, &protocol.Welcome{}, c.next(t).message)
+		c.requireOpen(t)
+	})
+
+	t.Run("must_pass_unknown_type", func(t *testing.T) {
+		setup()
+
+		c.send(t, `{"type":"describe.all","request_id":"123e4567-e89b-12d3-a456-426614174000"}`)
+		errorMessage := c.nextError(t)
+
+		require.Equal(t, &protocol.ErrorMessage{Code: protocol.CodeBadRequest, Message: `unknown message type "describe.all"`}, errorMessage)
+		c.requireOpen(t)
+	})
+
+	t.Run("must_pass_payload_too_large", func(t *testing.T) {
+		setup()
+		id := uuid.New()
+
+		c.describe(t, id, make([]byte, testMaxImageBytes+1))
+		errorMessage := c.nextError(t)
+
+		require.Equal(t, &id, errorMessage.RequestID)
+		require.Equal(t, protocol.CodePayloadTooLarge, errorMessage.Code)
+		require.Equal(t, fmt.Sprintf("image exceeds %d bytes", testMaxImageBytes), errorMessage.Message)
+		require.Zero(t, h.detector.Requests())
+		require.Equal(t, 1.0, testutil.ToFloat64(h.metrics.Requests.WithLabelValues(pipeline.KindDescribe, pipeline.StatusError)))
+		c.requireOpen(t)
+	})
+
+	t.Run("must_pass_question_too_long", func(t *testing.T) {
+		setup()
+		id := uuid.New()
+		c.send(t, fmt.Sprintf(`{"type":"ask.start","request_id":"%s","trigger":"hold","with_image":false}`, id))
+
+		c.send(t, fmt.Sprintf(`{"type":"ask.end","request_id":"%s","audio_ms":15001}`, id))
+		errorMessage := c.nextError(t)
+
+		require.Equal(t, &id, errorMessage.RequestID)
+		require.Equal(t, protocol.CodePayloadTooLarge, errorMessage.Code)
+		require.Equal(t, "question exceeds 15000 ms", errorMessage.Message)
+		c.requireOpen(t)
+	})
+
+	t.Run("must_pass_audio_out_from_client", func(t *testing.T) {
+		setup()
+		id := uuid.New()
+
+		c.sendFrame(t, protocol.EncodeFrame(&protocol.Frame{Kind: protocol.KindAudioOut, RequestID: id, Payload: []byte{0, 0}}))
+		errorMessage := c.nextError(t)
+
+		require.Equal(t, &protocol.ErrorMessage{RequestID: &id, Code: protocol.CodeBadRequest, Message: errAudioOutFromClient}, errorMessage)
+		c.requireOpen(t)
+	})
+
+	t.Run("must_pass_unexpected_image", func(t *testing.T) {
+		setup()
+		id := uuid.New()
+
+		c.sendFrame(t, protocol.EncodeFrame(&protocol.Frame{Kind: protocol.KindImageJPEG, RequestID: id, Payload: testImage}))
+		errorMessage := c.nextError(t)
+
+		require.Equal(t, &protocol.ErrorMessage{RequestID: &id, Code: protocol.CodeBadRequest, Message: errUnexpectedImage}, errorMessage)
+		c.requireOpen(t)
+	})
+}
+
+func TestSession_Cancel(t *testing.T) {
+	var (
+		h *harness
+		c *client
+	)
+
+	setup := func() {
+		logger.InitTestLogger()
+		h = newHarness(t, nil)
+		c = h.open(t)
+	}
+
+	cancelled := func() float64 {
+		return testutil.ToFloat64(h.metrics.Requests.WithLabelValues(pipeline.KindDescribe, pipeline.StatusCancelled))
+	}
+
+	t.Run("must_pass_cancel_message", func(t *testing.T) {
+		setup()
+		h.detector.Hold(true)
+		id := uuid.New()
+		c.describe(t, id, testImage)
+		require.Equal(t, &protocol.Accepted{RequestID: id}, c.next(t).message)
+		select {
+		case <-h.detector.Arrived():
+		case <-time.After(testTimeout):
+			t.Fatal("detector was not called")
+		}
+
+		c.send(t, fmt.Sprintf(`{"type":"cancel","request_id":"%s"}`, id))
+
+		require.Eventually(t, func() bool { return h.detector.Cancelled() == 1 }, testTimeout, 5*time.Millisecond)
+		require.Eventually(t, func() bool { return cancelled() == 1 }, testTimeout, 5*time.Millisecond)
+		// The pipeline is over: the next message is the answer to the probe, nothing of the request came.
+		c.send(t, testHello)
+		require.Equal(t, &protocol.ErrorMessage{Code: protocol.CodeBadRequest, Message: errHelloRepeated}, c.nextError(t))
+		require.Zero(t, h.tts.Texts())
+	})
+
+	t.Run("must_pass_new_request_cancels_previous", func(t *testing.T) {
+		setup()
+		h.tts.HoldFirst(true)
+		first := uuid.New()
+		c.describe(t, first, testImage)
+		for got := c.next(t); got.frame == nil; got = c.next(t) {
+			require.Equal(t, first, requestIDOf(got))
+		}
+
+		second := uuid.New()
+		c.describe(t, second, testImage)
+		all := c.until(t, second)
+
+		accepted := -1
+		for i, got := range all {
+			if got.message != nil {
+				if m, ok := got.message.(*protocol.Accepted); ok && m.RequestID == second {
+					accepted = i
+				}
+			}
+		}
+		require.GreaterOrEqual(t, accepted, 0)
+		var frames uint32
+		for _, got := range all[accepted:] {
+			require.Equal(t, second, requestIDOf(got))
+			if got.frame != nil {
+				require.Equal(t, frames, got.frame.Seq)
+				frames++
+			}
+		}
+		require.Positive(t, frames)
+		end := all[len(all)-1].message.(*protocol.AnswerEnd)
+		require.False(t, end.Degraded)
+		require.Eventually(t, func() bool { return h.tts.Cancelled() >= 1 }, testTimeout, 5*time.Millisecond)
+		require.Eventually(t, func() bool { return cancelled() == 1 }, testTimeout, 5*time.Millisecond)
+		require.Equal(t, 1.0, testutil.ToFloat64(h.metrics.Requests.WithLabelValues(pipeline.KindDescribe, pipeline.StatusOK)))
+	})
+
+	t.Run("must_pass_cancel_before_snapshot", func(t *testing.T) {
+		setup()
+		id := uuid.New()
+		c.send(t, fmt.Sprintf(`{"type":"describe","request_id":"%s","mode":"on_demand","focus":"all","image":{"width":640,"height":480,"bytes":13}}`, id))
+
+		c.send(t, fmt.Sprintf(`{"type":"cancel","request_id":"%s"}`, id))
+		c.sendFrame(t, protocol.EncodeFrame(&protocol.Frame{Kind: protocol.KindImageJPEG, RequestID: id, Payload: testImage}))
+		errorMessage := c.nextError(t)
+
+		require.Equal(t, &protocol.ErrorMessage{RequestID: &id, Code: protocol.CodeBadRequest, Message: errUnexpectedImage}, errorMessage)
+		require.Equal(t, 1.0, cancelled())
+		require.Zero(t, h.detector.Requests())
+	})
+}
+
+func TestSession_Keepalive(t *testing.T) {
+	var (
+		h     *harness
+		c     *client
+		pings atomic.Int32
+		read  chan error
+	)
+
+	setup := func(pong bool) {
+		logger.InitTestLogger()
+		h = newHarness(t, func(cfg *Config) {
+			cfg.PingInterval = 20 * time.Millisecond
+			cfg.PongTimeout = 150 * time.Millisecond
+		})
+		var err error
+		c, _, err = h.dial(testToken, Subprotocol)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = c.conn.Close() })
+		pings.Store(0)
+		c.conn.SetPingHandler(func(data string) error {
+			pings.Add(1)
+			if !pong {
+				return nil
+			}
+			return c.conn.WriteControl(websocket.PongMessage, []byte(data), time.Now().Add(time.Second))
+		})
+		read = make(chan error, 1)
+		go func() {
+			for {
+				if _, _, err := c.conn.ReadMessage(); err != nil {
+					read <- err
+					return
+				}
+			}
+		}()
+	}
+
+	t.Run("must_pass_ping_sent", func(t *testing.T) {
+		setup(true)
+
+		// Several pong timeouts pass: the session stays open while pongs come.
+		time.Sleep(500 * time.Millisecond)
+
+		require.GreaterOrEqual(t, pings.Load(), int32(5))
+		require.Equal(t, 1, h.server.Sessions())
+		select {
+		case err := <-read:
+			t.Fatalf("session closed: %v", err)
+		default:
+		}
+	})
+
+	t.Run("must_pass_closed_without_pong", func(t *testing.T) {
+		setup(false)
+
+		var err error
+		select {
+		case err = <-read:
+		case <-time.After(testTimeout):
+			t.Fatal("session was not closed")
+		}
+
+		require.Error(t, err)
+		require.Positive(t, pings.Load())
+		require.Eventually(t, func() bool { return h.server.Sessions() == 0 }, testTimeout, 10*time.Millisecond)
+	})
+
+	t.Run("must_pass_defaults", func(t *testing.T) {
+		cfg := NewConfig(&env.Vars{AppMaxImageBytes: 2097152}, testVersion)
+
+		require.Equal(t, 15*time.Second, cfg.PingInterval)
+		require.Equal(t, 30*time.Second, cfg.PongTimeout)
+		require.Equal(t, 5*time.Second, cfg.ShutdownGrace)
+		require.Equal(t, DefaultPingInterval, cfg.PingInterval)
+		require.Equal(t, DefaultPongTimeout, cfg.PongTimeout)
+	})
+}
+
+func TestSession_Shutdown(t *testing.T) {
+	var (
+		h *harness
+		c *client
+	)
+
+	setup := func() {
+		logger.InitTestLogger()
+		h = newHarness(t, func(cfg *Config) { cfg.ShutdownGrace = 2 * time.Second })
+		c = h.open(t)
+	}
+
+	t.Run("must_pass_close_going_away", func(t *testing.T) {
+		setup()
+		h.tts.ChunkPause(100 * time.Millisecond)
+		id := uuid.New()
+		c.describe(t, id, testImage)
+		require.Equal(t, &protocol.Accepted{RequestID: id}, c.next(t).message)
+		done := make(chan struct{})
+
+		go func() {
+			defer close(done)
+			h.server.Shutdown(context.Background())
+		}()
+		all := c.until(t, id)
+		_, _, err := c.conn.ReadMessage()
+		<-done
+
+		// The active request finished before the session was closed.
+		require.IsType(t, &protocol.AnswerEnd{}, all[len(all)-1].message)
+		var closeErr *websocket.CloseError
+		require.True(t, errors.As(err, &closeErr), err)
+		require.Equal(t, websocket.CloseGoingAway, closeErr.Code)
+		_, response, err := h.dial(testToken, Subprotocol)
+		require.ErrorIs(t, err, websocket.ErrBadHandshake)
+		require.Equal(t, http.StatusServiceUnavailable, response.StatusCode)
+	})
+}
+
+// requestIDOf returns the request_id of a message or a frame of a request.
+func requestIDOf(got received) uuid.UUID {
+	if got.frame != nil {
+		return got.frame.RequestID
+	}
+	switch m := got.message.(type) {
+	case *protocol.Accepted:
+		return m.RequestID
+	case *protocol.AnswerStart:
+		return m.RequestID
+	case *protocol.AnswerText:
+		return m.RequestID
+	case *protocol.AnswerEnd:
+		return m.RequestID
+	case *protocol.ErrorMessage:
+		if m.RequestID != nil {
+			return *m.RequestID
+		}
+	}
+	return uuid.Nil
+}
+
+func TestSession_Journal(t *testing.T) {
+	var (
+		h *harness
+	)
+
+	setup := func() {
+		logger.InitTestLogger()
+		h = newHarness(t, nil)
+	}
+
+	// records returns the journal records of the session of the given type.
+	records := func(kind any) []journal.Record {
+		found := []journal.Record{}
+		for _, call := range h.recorder.WriteCalls() {
+			if fmt.Sprintf("%T", call.Record) == fmt.Sprintf("%T", kind) {
+				found = append(found, call.Record)
+			}
+		}
+		return found
+	}
+
+	t.Run("must_pass_session_records", func(t *testing.T) {
+		setup()
+		c, _, err := h.dial(testToken, Subprotocol)
+		require.NoError(t, err)
+		c.send(t, `{"type":"hello","protocol":1,"device_id":"5f0c3a52-8a0b-4d4e-9c61-3f1d2b7a9e10","app_version":"0.1.0","locale":"ru-RU","platform":"android-34","network":"cellular","label":"P07"}`)
+		welcome := c.next(t).message.(*protocol.Welcome)
+
+		require.NoError(t, c.conn.Close())
+
+		require.Eventually(t, func() bool { return len(records(&journal.SessionEnd{})) == 1 }, testTimeout, 10*time.Millisecond)
+		started := records(&journal.Session{})
+		require.Len(t, started, 1)
+		session := started[0].(*journal.Session)
+		require.Equal(t, welcome.SessionID.String(), session.SessionID)
+		require.Equal(t, "5f0c3a52-8a0b-4d4e-9c61-3f1d2b7a9e10", session.DeviceID)
+		require.Equal(t, "0.1.0", session.AppVersion)
+		require.Equal(t, "cellular", session.Network)
+		require.Equal(t, "P07", session.Label)
+		require.Equal(t, time.UTC, session.StartedAt.Location())
+		end := records(&journal.SessionEnd{})[0].(*journal.SessionEnd)
+		require.Equal(t, session.SessionID, end.SessionID)
+		require.False(t, end.EndedAt.Before(session.StartedAt))
+	})
+
+	t.Run("must_pass_no_session_without_hello", func(t *testing.T) {
+		setup()
+		c, _, err := h.dial(testToken, Subprotocol)
+		require.NoError(t, err)
+
+		require.NoError(t, c.conn.Close())
+
+		require.Eventually(t, func() bool { return h.server.Sessions() == 0 }, testTimeout, 10*time.Millisecond)
+		require.Empty(t, h.recorder.WriteCalls())
+	})
+
+	t.Run("must_pass_client_metrics", func(t *testing.T) {
+		setup()
+		c := h.open(t)
+		id := uuid.New()
+		c.describe(t, id, testImage)
+		c.until(t, id)
+
+		c.send(t, fmt.Sprintf(`{"type":"client.metrics","request_id":"%s","network":"wifi","metrics":{"capture_ms":35,"encode_ms":20,"trigger_to_send_ms":70,"trigger_to_accepted_ms":120,"trigger_to_first_audio_ms":1310,"playback_underruns":0}}`, id))
+
+		require.Eventually(t, func() bool { return len(records(&journal.ClientMetrics{})) == 1 }, testTimeout, 10*time.Millisecond)
+		require.Equal(t, &journal.ClientMetrics{RequestID: id.String(), Metrics: map[string]float64{
+			"capture_ms": 35, "encode_ms": 20, "trigger_to_send_ms": 70, "trigger_to_accepted_ms": 120,
+			"trigger_to_first_audio_ms": 1310, "playback_underruns": 0,
+		}}, records(&journal.ClientMetrics{})[0])
+		require.Equal(t, 1, testutil.CollectAndCount(h.metrics.E2EDuration))
+		expected := `
+# HELP alv_e2e_duration_seconds Time from the trigger to the first audio reported by the application in client.metrics.
+# TYPE alv_e2e_duration_seconds histogram
+alv_e2e_duration_seconds_sum{kind="describe",network="wifi"} 1.31
+alv_e2e_duration_seconds_count{kind="describe",network="wifi"} 1
+`
+		require.NoError(t, testutil.CollectAndCompare(h.metrics.E2EDuration, strings.NewReader(expected), "alv_e2e_duration_seconds_sum", "alv_e2e_duration_seconds_count"))
+	})
+
+	t.Run("must_pass_client_metrics_after_error_without_e2e", func(t *testing.T) {
+		setup()
+		c := h.open(t)
+		id := uuid.New()
+
+		c.send(t, fmt.Sprintf(`{"type":"client.metrics","request_id":"%s","network":"cellular","metrics":{"trigger_to_send_ms":70}}`, id))
+		c.requireOpen(t)
+
+		require.Equal(t, &journal.ClientMetrics{RequestID: id.String(), Metrics: map[string]float64{"trigger_to_send_ms": 70}}, records(&journal.ClientMetrics{})[0])
+		require.Zero(t, testutil.CollectAndCount(h.metrics.E2EDuration))
+	})
+
+	t.Run("must_pass_recent_kinds_bounded", func(t *testing.T) {
+		setup()
+		s := newSession(h.server, nil)
+		first := uuid.New()
+
+		s.rememberKind(first, pipeline.KindAsk)
+		for i := 0; i < recentKinds; i++ {
+			s.rememberKind(uuid.New(), pipeline.KindDescribe)
+		}
+
+		require.Len(t, s.kinds, recentKinds)
+		require.Len(t, s.kindOrder, recentKinds)
+		require.NotContains(t, s.kinds, first)
+	})
+}
+
+func TestSession_PassiveJournal(t *testing.T) {
+	var (
+		h *harness
+	)
+
+	setup := func() {
+		logger.InitTestLogger()
+		h = newHarness(t, nil)
+	}
+
+	// passive sends a passive describe and its snapshot.
+	passive := func(t *testing.T, c *client, id uuid.UUID) {
+		t.Helper()
+		c.send(t, fmt.Sprintf(`{"type":"describe","request_id":"%s","mode":"passive","focus":"ahead","image":{"width":640,"height":480,"bytes":%d}}`, id, len(testImage)))
+		c.sendFrame(t, protocol.EncodeFrame(&protocol.Frame{Kind: protocol.KindImageJPEG, RequestID: id, Payload: testImage}))
+	}
+
+	// last reads until the last message of the passive request: passive.clear, answer.end or error.
+	last := func(t *testing.T, c *client, id uuid.UUID) protocol.Message {
+		t.Helper()
+		for {
+			switch m := c.next(t).message.(type) {
+			case *protocol.PassiveClear:
+				if m.RequestID == id {
+					return m
+				}
+			case *protocol.AnswerEnd:
+				if m.RequestID == id {
+					return m
+				}
+			case *protocol.ErrorMessage:
+				if m.RequestID != nil && *m.RequestID == id {
+					return m
+				}
+			}
+		}
+	}
+
+	t.Run("must_pass_skipped_journaled", func(t *testing.T) {
+		setup()
+		c := h.open(t)
+		// A question in progress: the passive request is skipped by the session
+		question := uuid.New()
+		c.send(t, fmt.Sprintf(`{"type":"ask.start","request_id":"%s","trigger":"hold","with_image":false}`, question))
+		id := uuid.New()
+		passive(t, c, id)
+
+		require.Equal(t, &protocol.PassiveClear{RequestID: id, Reason: protocol.ClearSkipped}, c.next(t).message)
+		var record *journal.Request
+		require.Eventually(t, func() bool {
+			for _, call := range h.recorder.WriteCalls() {
+				if r, ok := call.Record.(*journal.Request); ok && r.RequestID == id.String() {
+					record = r
+					return true
+				}
+			}
+			return false
+		}, testTimeout, 10*time.Millisecond)
+		require.Equal(t, pipeline.KindPassive, record.Kind)
+		require.Equal(t, pipeline.StatusSkipped, record.Status)
+		require.Equal(t, string(env.DescriberModeTemplate), record.DescriberMode)
+		require.Equal(t, testConfigID, record.ConfigID)
+		require.NotEmpty(t, record.SessionID)
+		require.Equal(t, time.UTC, record.CreatedAt.Location())
+		require.Equal(t, 1.0, testutil.ToFloat64(h.metrics.Requests.WithLabelValues(pipeline.KindPassive, pipeline.StatusSkipped)))
+	})
+
+	t.Run("must_pass_back_to_back_not_skipped", func(t *testing.T) {
+		setup()
+		c := h.open(t)
+		// The next passive request goes right after the last message of the previous one
+		for i := 0; i < 50; i++ {
+			id := uuid.New()
+			passive(t, c, id)
+			got := last(t, c, id)
+			if clear, ok := got.(*protocol.PassiveClear); ok {
+				require.NotEqual(t, protocol.ClearSkipped, clear.Reason, "request %d is skipped", i)
+			}
+			require.IsNotType(t, &protocol.ErrorMessage{}, got, "request %d failed", i)
+		}
+	})
+}
+
+func TestSession_Ignored(t *testing.T) {
+	var (
+		s *Session
+	)
+
+	setup := func() {
+		s = newSession(nil, nil)
+	}
+
+	t.Run("must_pass_bounded", func(t *testing.T) {
+		setup()
+		ids := make([]uuid.UUID, maxIgnored+1)
+		for i := range ids {
+			ids[i] = uuid.New()
+			s.ignore(ids[i])
+		}
+
+		require.Len(t, s.ignored, maxIgnored)
+		require.Len(t, s.ignoredOrder, maxIgnored)
+		require.False(t, s.ignored[ids[0]])
+		require.True(t, s.ignored[ids[maxIgnored]])
+	})
+}
+
+func TestSession_RequestJournal(t *testing.T) {
+	var (
+		h *harness
+		c *client
+	)
+
+	setup := func() {
+		logger.InitTestLogger()
+		h = newHarness(t, nil)
+		c = h.open(t)
+	}
+
+	// request waits for the journal record of the request and returns it.
+	request := func(t *testing.T, id uuid.UUID) *journal.Request {
+		t.Helper()
+		var found *journal.Request
+		require.Eventually(t, func() bool {
+			for _, call := range h.recorder.WriteCalls() {
+				if r, ok := call.Record.(*journal.Request); ok && r.RequestID == id.String() {
+					found = r
+					return true
+				}
+			}
+			return false
+		}, testTimeout, 10*time.Millisecond)
+		return found
+	}
+
+	// requireRecord checks the record of a request that ended without an answer.
+	requireRecord := func(t *testing.T, id uuid.UUID, kind, status string, code protocol.ErrorCode) {
+		t.Helper()
+		record := request(t, id)
+		require.Equal(t, kind, record.Kind)
+		require.Equal(t, status, record.Status)
+		require.Equal(t, string(code), record.ErrorCode)
+		require.Equal(t, string(env.DescriberModeTemplate), record.DescriberMode)
+		require.Equal(t, testConfigID, record.ConfigID)
+		require.NotEmpty(t, record.SessionID)
+		require.Equal(t, time.UTC, record.CreatedAt.Location())
+		require.Zero(t, record.ImageBytes)
+	}
+
+	// describeWaiting sends describe without its snapshot: the request waits for it.
+	describeWaiting := func(t *testing.T, id uuid.UUID) {
+		t.Helper()
+		c.send(t, fmt.Sprintf(`{"type":"describe","request_id":"%s","mode":"on_demand","focus":"all","image":{"width":640,"height":480,"bytes":13}}`, id))
+	}
+
+	// count returns how many journal records the request has.
+	count := func(id uuid.UUID) int {
+		n := 0
+		for _, call := range h.recorder.WriteCalls() {
+			if r, ok := call.Record.(*journal.Request); ok && r.RequestID == id.String() {
+				n++
+			}
+		}
+		return n
+	}
+
+	t.Run("must_pass_rejected_journaled", func(t *testing.T) {
+		setup()
+
+		// The snapshot over the limit
+		tooLarge := uuid.New()
+		c.describe(t, tooLarge, make([]byte, testMaxImageBytes+1))
+		require.Equal(t, protocol.CodePayloadTooLarge, c.nextError(t).Code)
+		requireRecord(t, tooLarge, pipeline.KindDescribe, pipeline.StatusError, protocol.CodePayloadTooLarge)
+
+		// The question too long: its pipeline runs from ask.start and records it
+		tooLong := uuid.New()
+		c.send(t, fmt.Sprintf(`{"type":"ask.start","request_id":"%s","trigger":"hold","with_image":false}`, tooLong))
+		c.send(t, fmt.Sprintf(`{"type":"ask.end","request_id":"%s","audio_ms":15001}`, tooLong))
+		require.Equal(t, protocol.CodePayloadTooLarge, c.nextError(t).Code)
+		requireRecord(t, tooLong, pipeline.KindAsk, pipeline.StatusError, protocol.CodePayloadTooLarge)
+
+		// busy while the server shuts down
+		h.server.registry.mu.Lock()
+		h.server.registry.closing = true
+		h.server.registry.mu.Unlock()
+		busy := uuid.New()
+		c.describe(t, busy, testImage)
+		// accepted goes before the start of the pipeline, so it may come before the error
+		all := c.until(t, busy)
+		require.Equal(t, protocol.CodeBusy, all[len(all)-1].message.(*protocol.ErrorMessage).Code)
+		requireRecord(t, busy, pipeline.KindDescribe, pipeline.StatusError, protocol.CodeBusy)
+
+		for _, id := range []uuid.UUID{tooLarge, tooLong, busy} {
+			require.Equal(t, 1, count(id))
+		}
+	})
+
+	t.Run("must_pass_cancelled_journaled", func(t *testing.T) {
+		setup()
+
+		// cancel before the snapshot
+		cancelled := uuid.New()
+		describeWaiting(t, cancelled)
+		c.send(t, fmt.Sprintf(`{"type":"cancel","request_id":"%s"}`, cancelled))
+		requireRecord(t, cancelled, pipeline.KindDescribe, pipeline.StatusCancelled, "")
+
+		// A new user request replaces the one waiting for its snapshot
+		replaced := uuid.New()
+		describeWaiting(t, replaced)
+		c.describe(t, uuid.New(), testImage)
+		requireRecord(t, replaced, pipeline.KindDescribe, pipeline.StatusCancelled, "")
+
+		// A question cancelled before ask.end: its pipeline records it
+		question := uuid.New()
+		c.send(t, fmt.Sprintf(`{"type":"ask.start","request_id":"%s","trigger":"hold","with_image":false}`, question))
+		c.send(t, fmt.Sprintf(`{"type":"cancel","request_id":"%s"}`, question))
+		requireRecord(t, question, pipeline.KindAsk, pipeline.StatusCancelled, "")
+
+		for _, id := range []uuid.UUID{cancelled, replaced, question} {
+			require.Equal(t, 1, count(id))
+		}
+	})
+
+	t.Run("must_pass_shutdown_waits_for_records", func(t *testing.T) {
+		setup()
+		question := uuid.New()
+		c.send(t, fmt.Sprintf(`{"type":"ask.start","request_id":"%s","trigger":"hold","with_image":false}`, question))
+		require.Eventually(t, func() bool { return h.server.registry.activeRequests() == 1 }, testTimeout, time.Millisecond)
+
+		// The grace period ends with the question still waiting for ask.end
+		h.server.registry.Shutdown(context.Background(), 0)
+
+		// Everything is recorded by the time Shutdown returns: the journal is stopped next
+		records := []string{}
+		for _, call := range h.recorder.WriteCalls() {
+			switch r := call.Record.(type) {
+			case *journal.Request:
+				if r.RequestID == question.String() {
+					records = append(records, "request")
+				}
+			case *journal.SessionEnd:
+				records = append(records, "session_end")
+			}
+		}
+		require.Equal(t, []string{"request", "session_end"}, records)
+		require.Zero(t, h.server.Sessions())
+	})
+}
+
+func TestSession_CloseJournal(t *testing.T) {
+	var (
+		h       *harness
+		c       *client
+		getLogs func() string
+	)
+
+	setup := func(grace time.Duration) {
+		getLogs = logger.InitTestLogger()
+		h = newHarness(t, func(cfg *Config) { cfg.ShutdownGrace = grace })
+		c = h.open(t)
+	}
+
+	// session returns the only session of the server.
+	session := func(t *testing.T) *Session {
+		t.Helper()
+		h.server.registry.mu.Lock()
+		defer h.server.registry.mu.Unlock()
+		require.Len(t, h.server.registry.sessions, 1)
+		for _, s := range h.server.registry.sessions {
+			return s
+		}
+		return nil
+	}
+
+	// requireCancelled checks that the request ended by the close of the session has
+	// exactly one journal record, cancelled without an error code, before the end of the
+	// session, and is counted as cancelled, not as an error.
+	requireCancelled := func(t *testing.T, id uuid.UUID, kind string) {
+		t.Helper()
+		ended := func() bool {
+			for _, call := range h.recorder.WriteCalls() {
+				if _, ok := call.Record.(*journal.SessionEnd); ok {
+					return true
+				}
+			}
+			return false
+		}
+		require.Eventually(t, ended, testTimeout, 10*time.Millisecond)
+
+		order := []string{}
+		var record *journal.Request
+		for _, call := range h.recorder.WriteCalls() {
+			switch r := call.Record.(type) {
+			case *journal.Request:
+				if r.RequestID == id.String() {
+					record = r
+					order = append(order, "request")
+				}
+			case *journal.SessionEnd:
+				order = append(order, "session_end")
+			}
+		}
+		require.Equal(t, []string{"request", "session_end"}, order)
+		require.Equal(t, kind, record.Kind)
+		require.Equal(t, pipeline.StatusCancelled, record.Status)
+		require.Empty(t, record.ErrorCode)
+		require.Equal(t, 1.0, testutil.ToFloat64(h.metrics.Requests.WithLabelValues(kind, pipeline.StatusCancelled)))
+		require.Zero(t, testutil.ToFloat64(h.metrics.Requests.WithLabelValues(kind, pipeline.StatusError)))
+		require.NotContains(t, getLogs(), "request failed")
+	}
+
+	t.Run("must_pass_waiting_snapshot_cancelled", func(t *testing.T) {
+		setup(DefaultShutdownGrace)
+		id := uuid.New()
+		c.send(t, fmt.Sprintf(`{"type":"describe","request_id":"%s","mode":"on_demand","focus":"all","image":{"width":640,"height":480,"bytes":13}}`, id))
+		s := session(t)
+		require.Eventually(t, func() bool { return s.find(id) != nil }, testTimeout, time.Millisecond)
+
+		// The connection is lost while the request waits for its snapshot
+		require.NoError(t, c.conn.Close())
+
+		requireCancelled(t, id, pipeline.KindDescribe)
+	})
+
+	t.Run("must_pass_detecting_cancelled", func(t *testing.T) {
+		setup(DefaultShutdownGrace)
+		h.detector.Hold(true)
+		id := uuid.New()
+		c.describe(t, id, testImage)
+		<-h.detector.Arrived()
+
+		// The connection is lost while the detector works on the snapshot
+		require.NoError(t, c.conn.Close())
+
+		requireCancelled(t, id, pipeline.KindDescribe)
+	})
+
+	t.Run("must_pass_question_cancelled", func(t *testing.T) {
+		setup(DefaultShutdownGrace)
+		id := uuid.New()
+		c.send(t, fmt.Sprintf(`{"type":"ask.start","request_id":"%s","trigger":"hold","with_image":false}`, id))
+		require.Eventually(t, func() bool { return h.server.registry.activeRequests() == 1 }, testTimeout, time.Millisecond)
+
+		// The connection is lost before ask.end
+		require.NoError(t, c.conn.Close())
+
+		requireCancelled(t, id, pipeline.KindAsk)
+	})
+
+	t.Run("must_pass_shutdown_cancelled", func(t *testing.T) {
+		setup(0)
+		h.detector.Hold(true)
+		detecting, waiting := uuid.New(), uuid.New()
+		// A passive request waits for its snapshot, a user request is in the detector
+		c.send(t, fmt.Sprintf(`{"type":"describe","request_id":"%s","mode":"passive","focus":"ahead","image":{"width":640,"height":480,"bytes":13}}`, waiting))
+		s := session(t)
+		require.Eventually(t, func() bool { return s.find(waiting) != nil }, testTimeout, time.Millisecond)
+		c.describe(t, detecting, testImage)
+		<-h.detector.Arrived()
+
+		// The gateway stops (SIGTERM): the grace period is over at once
+		h.server.Shutdown(context.Background())
+
+		requireCancelledShutdown := func(id uuid.UUID, kind string) {
+			var record *journal.Request
+			for _, call := range h.recorder.WriteCalls() {
+				if r, ok := call.Record.(*journal.Request); ok && r.RequestID == id.String() {
+					require.Nil(t, record, "one record of %s", id)
+					record = r
+				}
+			}
+			require.NotNil(t, record)
+			require.Equal(t, pipeline.StatusCancelled, record.Status)
+			require.Empty(t, record.ErrorCode)
+			require.Zero(t, testutil.ToFloat64(h.metrics.Requests.WithLabelValues(kind, pipeline.StatusError)))
+		}
+		requireCancelledShutdown(detecting, pipeline.KindDescribe)
+		requireCancelledShutdown(waiting, pipeline.KindPassive)
+		require.NotContains(t, getLogs(), "request failed")
+	})
+}

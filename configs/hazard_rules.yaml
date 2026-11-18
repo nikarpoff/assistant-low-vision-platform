@@ -1,0 +1,83 @@
+# Правила опасности (PLT-6). Файл подменяется переменной
+# APP_HAZARD_RULES_PATH, его хеш входит в config_id.
+#
+# Поля правила:
+#   name            - имя правила, уникальное; оно есть в тексте ошибок;
+#   classes         - классы словаря детектора (DET-2); неизвестный класс -
+#                     ошибка при старте с именем правила;
+#   directions      - left, ahead, right; пусто или нет поля - любое;
+#   distances       - near, far; пусто или нет поля - любое;
+#   min_confidence  - минимальная уверенность детектора, от 0 до 1;
+#   level           - danger (предупреждение) или notice (подсказка);
+#   phrase          - шаблон фразы: {direction} - «слева», «впереди»,
+#                     «справа»; {object} - название класса в форме ru.one
+#                     словаря. Точки в конце нет: фраза уходит в TTS как есть.
+#
+# Объект подпадает под правило, если совпали класс, направление и расстояние
+# и уверенность не ниже min_confidence. Если подходят несколько правил,
+# побеждает первое правило уровня danger, иначе первое уровня notice.
+#
+# Фразы правил по умолчанию совпадают с контрактом прогрева TTS
+# testdata/contracts/tts-service/prewarm_phrases.txt: правило, класс,
+# направление в порядке «слева, впереди, справа». При изменении правил
+# обновите контракт и запустите scripts/sync-contracts.sh.
+#
+# min_confidence в правилах по умолчанию равна рабочему порогу детектора
+# conf (DET-1), то есть сверх него ничего не отсекает.
+
+rules:
+  - name: vehicle_near
+    classes: [car, bus, truck, motorcycle]
+    directions: [left, ahead, right]
+    distances: [near]
+    min_confidence: 0.35
+    level: danger
+    phrase: "Осторожно, {direction} близко {object}"
+
+  - name: vehicle_ahead_far
+    classes: [car, bus, truck, motorcycle]
+    directions: [ahead]
+    distances: [far]
+    min_confidence: 0.35
+    level: notice
+    phrase: "Впереди {object}"
+
+  - name: two_wheeler_ahead_near
+    classes: [bicycle, scooter]
+    directions: [ahead]
+    distances: [near]
+    min_confidence: 0.35
+    level: danger
+    phrase: "Осторожно, впереди {object}"
+
+  - name: stairs_ahead_near
+    classes: [stairs]
+    directions: [ahead]
+    distances: [near]
+    min_confidence: 0.35
+    level: danger
+    phrase: "Осторожно, впереди ступени"
+
+  - name: obstacle_ahead_near
+    classes: [pole, barrier, bench, trash_can]
+    directions: [ahead]
+    distances: [near]
+    min_confidence: 0.35
+    level: danger
+    phrase: "Осторожно, впереди {object}"
+
+  - name: person_ahead_near
+    classes: [person]
+    directions: [ahead]
+    distances: [near]
+    min_confidence: 0.35
+    level: notice
+    phrase: "Впереди близко человек"
+
+  - name: crossing_ahead
+    classes: [crosswalk, traffic_light]
+    directions: [ahead]
+    distances: [near, far]
+    min_confidence: 0.35
+    level: notice
+    phrase: "Впереди {object}"

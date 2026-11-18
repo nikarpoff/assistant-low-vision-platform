@@ -1,0 +1,70 @@
+# Variant A, models machine: everything of our own here - gateway, PostgreSQL,
+# gpt2giga (profile gigachat), detector, ASR and TTS. The VM runs only Caddy
+# (compose.vm-proxy.yml) and proxies to the gateway through the tunnel.
+#
+#   docker compose --env-file .env --env-file reference.env -f compose.single.yml up -d
+#
+# The services extend compose.vm.yml and compose.models.yml, so the settings of
+# variants A and B are the same and their /v1/config snapshots differ only in placement.
+
+services:
+  gateway:
+    extends:
+      file: compose.vm.yml
+      service: gateway
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Variant A by definition: reference.env (placement B) does not relabel it
+      APP_PLACEMENT: A
+      # The model services are next to the gateway in alv-net
+      APP_DETECTOR_URL: http://detector:8000
+      APP_ASR_URL: http://asr:8000
+      APP_TTS_URL: http://tts:8000
+    # Only on the tunnel address: Caddy on the VM proxies here
+    ports:
+      - "${ALV_TUNNEL_MODELS_IP:-10.77.0.2}:8080:80"
+
+  postgres:
+    extends:
+      file: compose.vm.yml
+      service: postgres
+
+  gpt2giga:
+    extends:
+      file: compose.vm.yml
+      service: gpt2giga
+
+  # Not published: only the gateway inside alv-net calls the models
+  detector:
+    extends:
+      file: compose.models.yml
+      service: detector
+    ports: !reset []
+
+  asr:
+    extends:
+      file: compose.models.yml
+      service: asr
+    ports: !reset []
+
+  tts:
+    extends:
+      file: compose.models.yml
+      service: tts
+    ports: !reset []
+
+volumes:
+  postgres-data:
+  detector-weights:
+    name: alv-detector-weights
+  asr-weights:
+    name: alv-asr-weights
+  tts-weights:
+    name: alv-tts-weights
+
+# Compose creates the network itself: no manual `docker network create`
+networks:
+  default:
+    name: alv-net

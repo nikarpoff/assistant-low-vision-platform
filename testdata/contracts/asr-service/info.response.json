@@ -1,0 +1,14 @@
+{
+  "service": "asr-service",
+  "version": "0.1.0",
+  "git_sha": "3f2c1ab",
+  "backend": "gigaam",
+  "model": "v2_ctc",
+  "device": "cuda",
+  "warmed_up": true,
+  "params": {
+    "language": "ru",
+    "sample_rate": 16000,
+    "vad_enabled": true
+  }
+}

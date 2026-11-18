@@ -1,0 +1,23 @@
+# Variant A, VM: only Caddy - TLS and proxying to the gateway on the models machine
+# through the WireGuard tunnel (compose.single.yml publishes it on 10.77.0.2:8080).
+#
+#   docker compose --env-file .env -f compose.vm-proxy.yml up -d
+
+services:
+  caddy:
+    extends:
+      file: compose.vm.yml
+      service: caddy
+    # The gateway runs on the models machine, not here
+    depends_on: !reset []
+    environment:
+      ALV_GATEWAY_UPSTREAM: ${ALV_GATEWAY_UPSTREAM:-${ALV_TUNNEL_MODELS_IP:-10.77.0.2}:8080}
+
+volumes:
+  caddy-data:
+  caddy-config:
+
+# Compose creates the network itself: no manual `docker network create`
+networks:
+  default:
+    name: alv-net

@@ -1,0 +1,45 @@
+{
+  "config_id": "c9f2a1d0e3b4",
+  "since": "2026-11-01T10:00:00Z",
+  "until": "2026-11-01T12:00:00Z",
+  "kind": null,
+  "stages": {
+    "detect_ms": {
+      "n": 300,
+      "p50": 38.1,
+      "p95": 61.0,
+      "mean": 40.2
+    }
+  },
+  "e2e": {
+    "describe": {
+      "n": 300,
+      "p50": 1310.0,
+      "p95": 1820.0,
+      "mean": 1350.4
+    }
+  },
+  "degraded": {
+    "llm_timeout": {
+      "n": 9,
+      "share": 0.03
+    },
+    "llm_unavailable": {
+      "n": 3,
+      "share": 0.01
+    },
+    "tts_unavailable": {
+      "n": 0,
+      "share": 0.0
+    }
+  },
+  "llm_errors": {
+    "timeout_ttft": 9,
+    "http_429": 2,
+    "insufficient_balance": 1
+  },
+  "llm_fallback_share": 0.04,
+  "llm_models": {
+    "fake/fake-llm": 312
+  }
+}

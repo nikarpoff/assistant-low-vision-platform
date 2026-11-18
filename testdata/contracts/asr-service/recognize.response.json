@@ -1,0 +1,19 @@
+{
+  "text": "Где дверь?",
+  "normalized": "где дверь",
+  "language": "ru",
+  "speech": true,
+  "audio_duration_ms": 1830,
+  "model": {
+    "backend": "gigaam",
+    "name": "v2_ctc",
+    "device": "cuda"
+  },
+  "timings": {
+    "decode_ms": 1.2,
+    "vad_ms": 4.8,
+    "inference_ms": 38.5,
+    "total_ms": 46.0
+  },
+  "rtf": 0.025
+}

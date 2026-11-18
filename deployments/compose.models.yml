@@ -1,0 +1,106 @@
+# Variant B, models machine: detector and ASR on the GPU (-cuda images), TTS on the CPU (-cpu image).
+# Ports are published only on the tunnel address: bring WireGuard up before compose.
+#
+#   docker compose --env-file .env --env-file reference.env -f compose.models.yml up -d
+#
+# Weights live in named volumes (fetch them once with fetch-weights.sh), so a restart
+# downloads nothing. The volume names are fixed: compose.single.yml and fetch-weights.sh
+# use the same volumes.
+
+services:
+  detector:
+    image: ghcr.io/nikarpoff/objects-detector:${ALV_IMAGE_TAG:-latest}-cuda
+    restart: unless-stopped
+    environment:
+      MODEL_BACKEND: ${DETECTOR_MODEL_BACKEND:-fake}
+      MODEL_NAME: ${DETECTOR_MODEL_NAME:-}
+      TARGET_PLATFORM: ${DETECTOR_TARGET_PLATFORM:-cuda}
+      ARTIFACTS_PATH: /opt/model
+      # Library caches land in the volume too, so a restart downloads nothing
+      XDG_CACHE_HOME: /opt/model/.cache
+      AUTH_TOKEN: ${DETECTOR_AUTH_TOKEN:-}
+      WORKERS: ${DETECTOR_WORKERS:-1}
+      QUEUE_MAX: ${DETECTOR_QUEUE_MAX:-4}
+    volumes:
+      - detector-weights:/opt/model
+    ports:
+      - "${ALV_TUNNEL_MODELS_IP:-10.77.0.2}:8101:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  asr:
+    image: ghcr.io/nikarpoff/asr-service:${ALV_IMAGE_TAG:-latest}-cuda
+    restart: unless-stopped
+    environment:
+      MODEL_BACKEND: ${ASR_MODEL_BACKEND:-fake}
+      MODEL_NAME: ${ASR_MODEL_NAME:-}
+      TARGET_PLATFORM: ${ASR_TARGET_PLATFORM:-cuda}
+      ARTIFACTS_PATH: /opt/model
+      XDG_CACHE_HOME: /opt/model/.cache
+      AUTH_TOKEN: ${ASR_AUTH_TOKEN:-}
+      WORKERS: ${ASR_WORKERS:-1}
+      QUEUE_MAX: ${ASR_QUEUE_MAX:-4}
+    volumes:
+      - asr-weights:/opt/model
+    ports:
+      - "${ALV_TUNNEL_MODELS_IP:-10.77.0.2}:8102:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  tts:
+    image: ghcr.io/nikarpoff/tts-service:${ALV_IMAGE_TAG:-latest}-cpu
+    restart: unless-stopped
+    environment:
+      MODEL_BACKEND: ${TTS_MODEL_BACKEND:-fake}
+      MODEL_NAME: ${TTS_MODEL_NAME:-}
+      TARGET_PLATFORM: ${TTS_TARGET_PLATFORM:-cpu}
+      ARTIFACTS_PATH: /opt/model
+      XDG_CACHE_HOME: /opt/model/.cache
+      AUTH_TOKEN: ${TTS_AUTH_TOKEN:-}
+      WORKERS: ${TTS_WORKERS:-1}
+      QUEUE_MAX: ${TTS_QUEUE_MAX:-4}
+    volumes:
+      - tts-weights:/opt/model
+    ports:
+      - "${ALV_TUNNEL_MODELS_IP:-10.77.0.2}:8103:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  detector-weights:
+    name: alv-detector-weights
+  asr-weights:
+    name: alv-asr-weights
+  tts-weights:
+    name: alv-tts-weights
+
+# Compose creates the network itself: no manual `docker network create`
+networks:
+  default:
+    name: alv-net

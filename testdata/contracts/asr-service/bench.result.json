@@ -1,0 +1,18 @@
+{
+  "service": "asr-service",
+  "backend": "gigaam",
+  "model": "v2_ctc",
+  "device": "cuda",
+  "git_sha": "3f2c1ab",
+  "n": 50,
+  "warmup": 5,
+  "p50_ms": 41.8,
+  "p95_ms": 52.3,
+  "mean_ms": 43.1,
+  "std_ms": 4.6,
+  "hardware": {
+    "cpu": "AMD Ryzen 7 5700X",
+    "gpu": "NVIDIA GeForce RTX 3070"
+  },
+  "started_at": "2026-11-01T10:00:00Z"
+}
