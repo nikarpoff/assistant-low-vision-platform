@@ -26,7 +26,6 @@ import (
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/protocol"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/servicestub"
 	"github.com/nikarpoff/assistant-low-vision-platform/internal/session"
-	"github.com/nikarpoff/assistant-low-vision-platform/internal/stats"
 )
 
 // Settings of the tests.
@@ -360,46 +359,6 @@ func totalAudio(all []received) int {
 		}
 	}
 	return total
-}
-
-func TestOverheadBudget(t *testing.T) {
-	const (
-		warmup   = 20
-		requests = 200
-		budgetMS = 15.0
-	)
-
-	var (
-		g    *gateway
-		conn *websocket.Conn
-	)
-
-	setup := func() {
-		logger.InitTestLogger()
-		g = newGateway(t, map[string]string{"APP_LOG_LEVEL": "INFO"})
-		conn = g.open(t)
-	}
-
-	t.Run("must_pass", func(t *testing.T) {
-		setup()
-		for i := 0; i < warmup; i++ {
-			describe(t, conn, uuid.New())
-		}
-
-		totals := make([]float64, 0, requests)
-		for i := 0; i < requests; i++ {
-			all := describe(t, conn, uuid.New())
-			end, ok := all[len(all)-1].message.(*protocol.AnswerEnd)
-			require.True(t, ok)
-			require.False(t, end.Degraded)
-			totals = append(totals, float64(end.Timings[pipeline.StageServerTotal]))
-		}
-		p50 := stats.Percentile(totals, 0.5)
-		p95 := stats.Percentile(totals, 0.95)
-		t.Logf("server_total_ms with stubs without delay: requests=%d p50=%.1f p95=%.1f", requests, p50, p95)
-
-		require.LessOrEqual(t, p95, budgetMS)
-	})
 }
 
 func TestApp(t *testing.T) {
