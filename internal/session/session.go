@@ -398,7 +398,10 @@ func (s *Session) onDescribe(m *protocol.Describe) {
 }
 
 // onPassive starts a passive request unless a user or a passive request is in progress:
-// then the answer is passive.clear with the reason skipped (PROTO-8).
+// then the answer is passive.clear with the reason skipped (PROTO-8). It is the only place
+// that decides whether a passive request is skipped, and it decides before accepted, so a
+// passive request never gets both. A slot is free from the cancel of its request or its
+// replacement by a new user request on, even while the cancelled pipeline still winds down.
 func (s *Session) onPassive(m *protocol.Describe) {
 	s.mu.Lock()
 	busy := s.user != nil || s.passive != nil

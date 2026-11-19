@@ -2,7 +2,6 @@ package pipeline
 
 import (
 	"context"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -32,24 +31,16 @@ type PassiveRequest struct {
 // with kind warning, priority high for a danger - or passive.clear with the reason. The
 // language model is never called. accepted is sent by the session.
 //
-// The request is skipped while a user request or another passive request of the session
-// is in progress, and its result is stale once APP_PASSIVE_DEADLINE_MS has passed since
-// the snapshot came, by the clock of the gateway (PROTO-8).
+// Whether the request is skipped while a user request or another passive request of the
+// session is in progress is decided by the session alone, before accepted (PROTO-8): the
+// pipeline runs every request it gets. Its result is stale once APP_PASSIVE_DEADLINE_MS
+// has passed since the snapshot came, by the clock of the gateway (PROTO-8).
 func (p *Pipeline) Passive(ctx context.Context, req *PassiveRequest, sink Sink) {
 	r := p.newRun(ctx, KindPassive, req.RequestID, req.SessionID, req.ReceivedAt, sink)
 	defer r.cancel()
 	r.timings.Set(StageReceive, req.ReceivedAt.Sub(req.StartedAt))
 	r.record.ImageBytes = len(req.Image)
 
-	release, ok := p.beginPassive(req.SessionID)
-	if !ok {
-		p.clear(r, protocol.ClearSkipped)
-		p.finish(r)
-		return
-	}
-	release = sync.OnceFunc(release)
-	defer release()
-	r.release = release
 	r.staleAt = req.ReceivedAt.Add(p.cfg.PassiveDeadline)
 	if !time.Now().Before(r.staleAt) {
 		p.clear(r, protocol.ClearStale)
@@ -153,8 +144,6 @@ func (p *Pipeline) warn(r *run, warnings []hazard.Match, objects []detector.Obje
 // clear ends the passive request without a warning.
 func (p *Pipeline) clear(r *run, reason protocol.ClearReason) {
 	switch reason {
-	case protocol.ClearSkipped:
-		r.status = StatusSkipped
 	case protocol.ClearStale:
 		r.status = StatusStale
 	default:
@@ -193,55 +182,4 @@ func (p *Pipeline) cooldown(deviceID string) *hazard.Cooldown {
 	}
 	entry.used = now
 	return entry.cooldown
-}
-
-// inProgress counts the requests of a session in progress in the pipelines.
-type inProgress struct {
-	user    int
-	passive int
-}
-
-// beginUser marks a user request of the session in progress and returns its end.
-func (p *Pipeline) beginUser(sessionID string) func() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	p.session(sessionID).user++
-	return func() { p.leave(sessionID, func(s *inProgress) { s.user-- }) }
-}
-
-// beginPassive marks a passive request of the session in progress unless a user or a
-// passive request of the session is in progress (PROTO-8); it returns the end of the request.
-func (p *Pipeline) beginPassive(sessionID string) (func(), bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	s := p.session(sessionID)
-	if s.user > 0 || s.passive > 0 {
-		return nil, false
-	}
-	s.passive++
-	return func() { p.leave(sessionID, func(s *inProgress) { s.passive-- }) }, true
-}
-
-// leave ends a request of the session; a session without requests in progress is forgotten.
-func (p *Pipeline) leave(sessionID string, done func(s *inProgress)) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	s := p.session(sessionID)
-	done(s)
-	if s.user <= 0 && s.passive <= 0 {
-		delete(p.sessions, sessionID)
-	}
-}
-
-// session returns the requests in progress of the session, creating them; p.mu must be held.
-func (p *Pipeline) session(sessionID string) *inProgress {
-	s, ok := p.sessions[sessionID]
-	if !ok {
-		s = &inProgress{}
-		p.sessions[sessionID] = s
-	}
-	return s
 }
