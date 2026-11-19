@@ -939,3 +939,131 @@ func TestLLMModels(t *testing.T) {
 		require.NotContains(t, err.Error(), testAPIKey)
 	})
 }
+
+func TestLLMErrorBody(t *testing.T) {
+	const (
+		errorCode = "SERVICE_UNAVAILABLE"
+		// errorBodyStart is an error body in the Polza.ai format; the tests pad it with spaces
+		errorBodyStart = `{"error":{"code":"SERVICE_UNAVAILABLE","message":"Ошибка поставщика","trace_id":"test-trace"},"trace_id":"test-trace"}`
+	)
+
+	var (
+		m       *metrics.Metrics
+		client  *Client
+		server  *httptest.Server
+		dials   atomic.Int32
+		getLogs func() string
+		request *Request
+	)
+
+	// paddedBody is the error body padded with spaces to size bytes
+	paddedBody := func(size int) string {
+		return errorBodyStart + strings.Repeat(" ", size-len(errorBodyStart))
+	}
+
+	// setup answers /chat/completions with 503 and the body written by writeBody, /models with 200
+	setup := func(t *testing.T, writeBody func(w http.ResponseWriter)) {
+		getLogs = logger.InitTestLogger()
+		m = metrics.NewMetrics()
+		dials.Store(0)
+		server = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body)
+			if r.URL.Path == fakellm.PathModels {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"object":"list","data":[]}`)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			writeBody(w)
+		}))
+		server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+			if state == http.StateNew {
+				dials.Add(1)
+			}
+		}
+		server.Start()
+		t.Cleanup(server.Close)
+
+		var err error
+		client, err = NewClient(Config{
+			URL:          server.URL + fakellm.BasePath,
+			APIKey:       testAPIKey,
+			TTFTTimeout:  5 * time.Second,
+			TotalTimeout: 5 * time.Second,
+		}, m)
+		require.NoError(t, err)
+
+		request = &Request{RequestID: testRequestID, Model: testModel, Messages: []Message{{Role: RoleUser, Content: "?"}}}
+	}
+
+	// requireFailure checks the error of the 503 answer, its metric and log line
+	requireFailure := func(t *testing.T, err error) {
+		reason := reasonForStatus(http.StatusServiceUnavailable)
+		var failure *Error
+		require.ErrorAs(t, err, &failure)
+		require.Equal(t, reason, failure.Reason)
+		require.Equal(t, http.StatusServiceUnavailable, failure.StatusCode)
+		require.Equal(t, errorCode, failure.Code)
+		require.Equal(t, testTraceID, failure.TraceID)
+		require.NoError(t, failure.Err)
+		require.ErrorIs(t, err, ErrUnavailable)
+		require.EqualError(t, err, fmt.Sprintf(errorFormat, reason, http.StatusServiceUnavailable, errorCode, testTraceID))
+		require.Equal(t, 1.0, testutil.ToFloat64(m.UpstreamErrors.WithLabelValues(upstreamLabel, string(reason))))
+		require.Contains(t, getLogs(), fmt.Sprintf(logFailureFormat, testRequestID, reason, http.StatusServiceUnavailable, errorCode, testTraceID))
+		require.NotContains(t, getLogs(), "Ошибка поставщика")
+	}
+
+	writeSized := func(size int) func(w http.ResponseWriter) {
+		return func(w http.ResponseWriter) {
+			_, _ = io.WriteString(w, paddedBody(size))
+		}
+	}
+
+	t.Run("must_pass_same_connection_after_short_error_body", func(t *testing.T) {
+		setup(t, writeSized(1<<10))
+
+		_, err := client.Complete(context.Background(), request, func(string) error { return nil })
+		requireFailure(t, err)
+		require.NoError(t, client.Models(context.Background()))
+
+		require.Equal(t, int32(1), dials.Load())
+	})
+
+	t.Run("must_pass_same_connection_after_long_error_body", func(t *testing.T) {
+		setup(t, writeSized(100<<10))
+
+		_, err := client.Complete(context.Background(), request, func(string) error { return nil })
+		requireFailure(t, err)
+		require.NoError(t, client.Models(context.Background()))
+
+		require.Equal(t, int32(1), dials.Load())
+	})
+
+	t.Run("must_fail_error_body_over_limit", func(t *testing.T) {
+		setup(t, writeSized(1<<20))
+
+		_, err := client.Complete(context.Background(), request, func(string) error { return nil })
+		requireFailure(t, err)
+		require.NoError(t, client.Models(context.Background()))
+
+		require.Equal(t, int32(2), dials.Load())
+	})
+
+	t.Run("must_fail_error_body_never_ends", func(t *testing.T) {
+		release := make(chan struct{})
+		setup(t, func(w http.ResponseWriter) {
+			_, _ = io.WriteString(w, paddedBody(100<<10))
+			w.(http.Flusher).Flush()
+			<-release
+		})
+		t.Cleanup(func() { close(release) })
+
+		started := time.Now()
+		_, err := client.Complete(context.Background(), request, func(string) error { return nil })
+		elapsed := time.Since(started)
+
+		requireFailure(t, err)
+		require.Less(t, elapsed, time.Second)
+	})
+}
