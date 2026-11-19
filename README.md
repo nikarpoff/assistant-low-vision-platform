@@ -208,7 +208,7 @@ APP_SERVER_PORT=8080 APP_AUTH_DISABLED=true APP_DESCRIBER_MODE=template go run .
 - `answer.end` содержит полный текст, объекты в фокусе (опасности первыми, `hazard=true` только для уровня `danger`), `hazard` и `timings`: `receive_ms`, `queue_ms`, `detect_ms`, `llm_ttft_ms`, `llm_first_sentence_ms`, `llm_total_ms` (режимы `llm` и `vlm`), `tts_first_chunk_ms`, `tts_total_ms`, `server_ttfa_ms`, `server_total_ms`. Те же этапы идут в `alv_stage_duration_seconds{stage, kind}`, итог запроса - в `alv_requests_total{kind, status}`.
 - Весь запрос ограничен `APP_REQUEST_DEADLINE_MS` от получения полного входа: превышение до начала ответа - `error` с кодом `upstream_timeout`. Отказы сервисов и поставщика - по разделу «Деградация».
 - Описанная сцена (объекты, текст, время снимка) записывается в историю устройства.
-- Собственная обработка Шлюза с заглушками сервисов без задержки укладывается в 15 мс p95 (PLT-18, тест `TestOverheadBudget`).
+- Собственная обработка Шлюза с заглушками сервисов без задержки укладывается в 15 мс p95 (PLT-18, тест `TestOverheadBudget`). Без `-race` тест проверяет 15 мс p95 на 200 запросах и пишет в лог `requests=200 p50=... p95=... budget_ms=15`. Под `-race` тест исключён ограничением сборки `//go:build !race`: детектор гонок замедляет код в разы, и такой замер не говорит о PLT-18. Бюджет NFR-2 на стенде проверяет задача `002-hypothesis-experiment`.
 
 ### Конвейер вопроса
 
