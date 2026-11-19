@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -550,6 +551,9 @@ func (s *Session) handleFrame(data []byte) {
 func (s *Session) onImage(frame *protocol.Frame) {
 	if s.ignored[frame.RequestID] {
 		delete(s.ignored, frame.RequestID)
+		if i := slices.Index(s.ignoredOrder, frame.RequestID); i >= 0 {
+			s.ignoredOrder = slices.Delete(s.ignoredOrder, i, i+1)
+		}
 		return
 	}
 	r := s.find(frame.RequestID)
@@ -659,10 +663,14 @@ func (s *Session) release(r *request) {
 	}
 }
 
-// ignore remembers a skipped passive request, so its snapshot is dropped silently; the
-// oldest is forgotten beyond maxIgnored.
+// ignore remembers a skipped passive request, so its snapshot is dropped silently. Only
+// the requests whose snapshot is still to come are kept: with maxIgnored of them the
+// oldest is forgotten.
 func (s *Session) ignore(id uuid.UUID) {
-	if len(s.ignoredOrder) == maxIgnored {
+	if s.ignored[id] {
+		return
+	}
+	if len(s.ignored) == maxIgnored {
 		delete(s.ignored, s.ignoredOrder[0])
 		s.ignoredOrder = s.ignoredOrder[1:]
 	}

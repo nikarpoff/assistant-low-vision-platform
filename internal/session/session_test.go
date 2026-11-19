@@ -1290,6 +1290,61 @@ func TestSession_Ignored(t *testing.T) {
 		require.False(t, s.ignored[ids[0]])
 		require.True(t, s.ignored[ids[maxIgnored]])
 	})
+
+	t.Run("must_pass_snapshot_forgets", func(t *testing.T) {
+		setup()
+		first, middle, last := uuid.New(), uuid.New(), uuid.New()
+		for _, id := range []uuid.UUID{first, middle, last} {
+			s.ignore(id)
+		}
+
+		s.onImage(&protocol.Frame{Kind: protocol.KindImageJPEG, RequestID: middle, Payload: testImage})
+
+		require.Equal(t, map[uuid.UUID]bool{first: true, last: true}, s.ignored)
+		require.Equal(t, []uuid.UUID{first, last}, s.ignoredOrder)
+	})
+
+	t.Run("must_pass_bounded_after_snapshot", func(t *testing.T) {
+		setup()
+		ids := make([]uuid.UUID, maxIgnored)
+		for i := range ids {
+			ids[i] = uuid.New()
+			s.ignore(ids[i])
+		}
+
+		// The snapshot of a skipped request frees its place: the next one evicts nothing
+		s.onImage(&protocol.Frame{Kind: protocol.KindImageJPEG, RequestID: ids[maxIgnored/2], Payload: testImage})
+		next := uuid.New()
+		s.ignore(next)
+
+		require.True(t, s.ignored[ids[0]])
+		require.True(t, s.ignored[next])
+		require.False(t, s.ignored[ids[maxIgnored/2]])
+		require.Len(t, s.ignored, maxIgnored)
+		require.Len(t, s.ignoredOrder, maxIgnored)
+		require.Equal(t, ids[0], s.ignoredOrder[0])
+	})
+
+	t.Run("must_fail_second_snapshot_unexpected_image", func(t *testing.T) {
+		logger.InitTestLogger()
+		h := newHarness(t, nil)
+		c := h.open(t)
+		// A question in progress: the passive request is skipped
+		question := uuid.New()
+		c.send(t, fmt.Sprintf(`{"type":"ask.start","request_id":"%s","trigger":"hold","with_image":false}`, question))
+		id := uuid.New()
+		c.send(t, fmt.Sprintf(`{"type":"describe","request_id":"%s","mode":"passive","focus":"ahead","image":{"width":640,"height":480,"bytes":%d}}`, id, len(testImage)))
+		require.Equal(t, &protocol.PassiveClear{RequestID: id, Reason: protocol.ClearSkipped}, c.next(t).message)
+		snapshot := protocol.EncodeFrame(&protocol.Frame{Kind: protocol.KindImageJPEG, RequestID: id, Payload: testImage})
+
+		// The first snapshot is dropped silently: the next message is the answer to the probe
+		c.sendFrame(t, snapshot)
+		c.send(t, testHello)
+		require.Equal(t, &protocol.ErrorMessage{Code: protocol.CodeBadRequest, Message: errHelloRepeated}, c.nextError(t))
+		c.sendFrame(t, snapshot)
+
+		require.Equal(t, &protocol.ErrorMessage{RequestID: &id, Code: protocol.CodeBadRequest, Message: errUnexpectedImage}, c.nextError(t))
+	})
 }
 
 func TestSession_RequestJournal(t *testing.T) {
