@@ -1052,6 +1052,17 @@ func TestLLMErrorBody(t *testing.T) {
 		require.Equal(t, int32(1), dials.Load())
 	})
 
+	t.Run("must_fail_error_body_one_byte_over_limit", func(t *testing.T) {
+		// 128 KiB and one byte: the body is over the limit, the connection is not reused
+		setup(t, writeSized(128<<10+1))
+
+		_, err := client.Complete(context.Background(), request, func(string) error { return nil })
+		requireFailure(t, err)
+		require.NoError(t, client.Models(context.Background()))
+
+		require.Equal(t, int32(2), dials.Load())
+	})
+
 	t.Run("must_fail_error_body_over_limit", func(t *testing.T) {
 		setup(t, writeSized(1<<20))
 
