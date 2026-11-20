@@ -15,9 +15,6 @@ import (
 // Close reason of the sessions closed on shutdown.
 const msgGoingAway = "server is going away"
 
-// shutdownPoll is how often Shutdown checks whether the active requests are over.
-const shutdownPoll = 10 * time.Millisecond
-
 // drainTimeout is how long a closed session waits for its cancelled pipelines and the
 // shutdown waits for the closed sessions to record their ends.
 const drainTimeout = 2 * time.Second
@@ -29,6 +26,9 @@ type Registry struct {
 	mu       sync.Mutex
 	sessions map[uuid.UUID]*Session
 	closing  bool
+
+	requests tracker // requests whose pipeline runs, in all sessions
+	open     tracker // sessions in the registry
 }
 
 // NewRegistry creates an empty registry that reports its size to the gauge.
@@ -64,6 +64,7 @@ func (r *Registry) add(s *Session) bool {
 		return false
 	}
 	r.sessions[s.id] = s
+	r.open.add()
 	r.active.Inc()
 	return true
 }
@@ -75,13 +76,35 @@ func (r *Registry) remove(s *Session) {
 
 	if _, ok := r.sessions[s.id]; ok {
 		delete(r.sessions, s.id)
+		r.open.done()
 		r.active.Dec()
 	}
 }
 
+// beginRequest counts a request whose pipeline is about to run; false when the registry
+// is shutting down. The check and the count are one step under r.mu, so Shutdown either
+// refuses the request or waits for it.
+func (r *Registry) beginRequest() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.closing {
+		return false
+	}
+	r.requests.add()
+	return true
+}
+
+// endRequest is called when the pipeline of a request counted by beginRequest returns.
+func (r *Registry) endRequest() {
+	r.requests.done()
+}
+
 // Shutdown takes no more sessions or requests, waits until the active requests are
 // over but not longer than grace or ctx, and closes every session with the code 1001
-// after the messages already queued.
+// after the messages already queued. Then it waits until the closed sessions record
+// their ends, at most 2 * drainTimeout. Every wait ends as soon as there is nothing
+// left to wait for.
 func (r *Registry) Shutdown(ctx context.Context, grace time.Duration) {
 	r.mu.Lock()
 	r.closing = true
@@ -89,17 +112,8 @@ func (r *Registry) Shutdown(ctx context.Context, grace time.Duration) {
 
 	ctx, cancel := context.WithTimeout(ctx, grace)
 	defer cancel()
-
-	ticker := time.NewTicker(shutdownPoll)
-	defer ticker.Stop()
-wait:
-	for r.activeRequests() > 0 {
-		select {
-		case <-ctx.Done():
-			logger.Warning("shutdown grace period is over, active requests are cancelled: requests=%d", r.activeRequests())
-			break wait
-		case <-ticker.C:
-		}
+	if !r.requests.wait(ctx) {
+		logger.Warning("shutdown grace period is over, active requests are cancelled: requests=%d", r.activeRequests())
 	}
 
 	r.mu.Lock()
@@ -121,21 +135,13 @@ wait:
 
 	// The sessions record their cancelled requests and their ends after the close:
 	// the journal is stopped after Shutdown, so their records are waited for
-	deadline := time.Now().Add(2 * drainTimeout)
-	for r.Len() > 0 && time.Now().Before(deadline) {
-		time.Sleep(shutdownPoll)
-	}
+	drain, cancelDrain := context.WithTimeout(context.Background(), 2*drainTimeout)
+	defer cancelDrain()
+	r.open.wait(drain)
 	logger.Info("sessions closed: sessions=%d", len(sessions))
 }
 
 // activeRequests returns the number of requests running in all sessions.
 func (r *Registry) activeRequests() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	total := 0
-	for _, s := range r.sessions {
-		total += int(s.active.Load())
-	}
-	return total
+	return r.requests.count()
 }
