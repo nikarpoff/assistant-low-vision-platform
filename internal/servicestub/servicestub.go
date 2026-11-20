@@ -280,8 +280,8 @@ type TTS struct {
 	times       []time.Time
 	delays      map[string]time.Duration
 	holdFirst   bool
-	gateFirst   bool
-	second      chan struct{}
+	order       *finishOrder
+	finished    []string
 	fail        bool
 	active      int
 	maxActive   int
@@ -296,7 +296,6 @@ func NewTTS() *TTS {
 		info:    mustRead("tts-service", "info.response.json"),
 		delays:  map[string]time.Duration{},
 		arrived: make(chan string, 64),
-		second:  make(chan struct{}),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(pathSynthesize, t.synthesize)
@@ -336,13 +335,33 @@ func (t *TTS) HoldFirst(hold bool) {
 	t.holdFirst = hold
 }
 
-// GateFirst makes the first synthesis wait before its first chunk until the second
-// synthesis comes, so the two are surely active at once.
-func (t *TTS) GateFirst(gate bool) {
+// finishOrder makes the synthesis of slow finish after the one of fast while both are active.
+type finishOrder struct {
+	slow, fast    string
+	slowCame      chan struct{}
+	fastDone      chan struct{}
+	closeSlowCame func()
+	closeFastDone func()
+}
+
+// FinishAfter orders two syntheses without delays: the synthesis of fast waits before
+// its first chunk until the one of slow comes, and the synthesis of slow waits before
+// its first chunk until the one of fast has sent its last chunk. So the two are surely
+// active at once, and slow surely finishes after fast.
+func (t *TTS) FinishAfter(slow, fast string) {
+	order := &finishOrder{
+		slow:     slow,
+		fast:     fast,
+		slowCame: make(chan struct{}),
+		fastDone: make(chan struct{}),
+	}
+	order.closeSlowCame = sync.OnceFunc(func() { close(order.slowCame) })
+	order.closeFastDone = sync.OnceFunc(func() { close(order.fastDone) })
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	t.gateFirst = gate
+	t.order = order
 }
 
 // Fail makes every synthesis answer 503.
@@ -364,6 +383,14 @@ func (t *TTS) Texts() []string {
 	defer t.mu.Unlock()
 
 	return append([]string(nil), t.texts...)
+}
+
+// Finished returns the texts of the syntheses that sent their last chunk, in the order they did.
+func (t *TTS) Finished() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return append([]string(nil), t.finished...)
 }
 
 // Times returns when the synthesis requests came.
@@ -413,10 +440,7 @@ func (t *TTS) synthesize(w http.ResponseWriter, r *http.Request) {
 	t.texts = append(t.texts, request.Text)
 	t.times = append(t.times, time.Now())
 	hold := first && t.holdFirst
-	gate := first && t.gateFirst
-	if len(t.texts) == 2 {
-		close(t.second)
-	}
+	order := t.order
 	fail := t.fail
 	delay := t.delays[request.Text]
 	pause := t.chunkPauses
@@ -437,7 +461,17 @@ func (t *TTS) synthesize(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable)
 		return
 	}
-	if gate && !t.waitSecond(r) {
+	var before <-chan struct{}
+	if order != nil {
+		switch request.Text {
+		case order.slow:
+			order.closeSlowCame()
+			before = order.fastDone
+		case order.fast:
+			before = order.slowCame
+		}
+	}
+	if before != nil && !t.waitFor(r, before) {
 		return
 	}
 	if !t.wait(r, delay) {
@@ -470,13 +504,20 @@ func (t *TTS) synthesize(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+	t.mu.Lock()
+	t.finished = append(t.finished, request.Text)
+	t.mu.Unlock()
+	if order != nil && request.Text == order.fast {
+		order.closeFastDone()
+	}
 }
 
-// waitSecond pauses until the second synthesis comes; false if the client gave the
-// request up meanwhile or the second one never came within holdLimit.
-func (t *TTS) waitSecond(r *http.Request) bool {
+// waitFor pauses until ch is closed; false if the client gave the request up meanwhile
+// or ch was not closed within holdLimit.
+func (t *TTS) waitFor(r *http.Request, ch <-chan struct{}) bool {
 	select {
-	case <-t.second:
+	case <-ch:
 		return true
 	case <-r.Context().Done():
 		t.mu.Lock()

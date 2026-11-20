@@ -1276,6 +1276,14 @@ func TestSession_PassiveSlots(t *testing.T) {
 		require.False(t, requireInvariant(t, id, seq))
 		require.Equal(t, protocol.AnswerKindWarning, seq[1].(*protocol.AnswerStart).Kind)
 		require.Equal(t, protocol.PriorityHigh, seq[1].(*protocol.AnswerStart).Priority)
+		require.NotNil(t, seq[1].(*protocol.AnswerStart).Audio)
+		texts := []string{}
+		for _, m := range seq {
+			if text, ok := m.(*protocol.AnswerText); ok {
+				texts = append(texts, text.Text)
+			}
+		}
+		require.Equal(t, []string{"Осторожно, впереди ступени."}, texts)
 		require.IsType(t, &protocol.AnswerEnd{}, seq[len(seq)-1])
 		require.Equal(t, pipeline.StatusOK, requireOneRecord(t, id).Status)
 		require.Equal(t, before+1, passiveCount())
@@ -1442,8 +1450,9 @@ func TestSession_RequestJournal(t *testing.T) {
 		h.server.registry.mu.Unlock()
 		busy := uuid.New()
 		c.describe(t, busy, testImage)
-		// accepted goes before the start of the pipeline, so it may come before the error
+		// The request is refused before it is counted and before accepted: only the error comes
 		all := c.until(t, busy)
+		require.Len(t, all, 1)
 		require.Equal(t, protocol.CodeBusy, all[len(all)-1].message.(*protocol.ErrorMessage).Code)
 		requireRecord(t, busy, pipeline.KindDescribe, pipeline.StatusError, protocol.CodeBusy)
 
@@ -1817,6 +1826,16 @@ func TestSession_DrainWait(t *testing.T) {
 		return records.sessionEnd()
 	}
 
+	// wait waits for a signal.
+	wait := func(t *testing.T, signal <-chan struct{}, what string) {
+		t.Helper()
+		select {
+		case <-signal:
+		case <-time.After(testTimeout):
+			t.Fatalf("%s did not come", what)
+		}
+	}
+
 	t.Run("must_pass_session_end_after_pipelines", func(t *testing.T) {
 		gated := newGatedDetector(1)
 		t.Cleanup(gated.open)
@@ -1827,7 +1846,7 @@ func TestSession_DrainWait(t *testing.T) {
 		c := h.open(t)
 		id := uuid.New()
 		c.describe(t, id, testImage)
-		<-gated.arrived
+		wait(t, gated.arrived, "describe in the detector")
 
 		// The connection is lost while the pipeline is in the detector, which holds it
 		require.NoError(t, c.conn.Close())
@@ -1857,7 +1876,7 @@ func TestSession_DrainWait(t *testing.T) {
 		setup(harnessOptions{pipelines: stuck})
 		c := h.open(t)
 		c.describe(t, uuid.New(), testImage)
-		<-arrived
+		wait(t, arrived, "describe in the stuck pipeline")
 
 		closedAt := time.Now()
 		require.NoError(t, c.conn.Close())

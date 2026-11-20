@@ -999,6 +999,7 @@ func TestLLMErrorBody(t *testing.T) {
 
 	// requireFailure checks the error of the 503 answer, its metric and log line
 	requireFailure := func(t *testing.T, err error) {
+		t.Helper()
 		reason := reasonForStatus(http.StatusServiceUnavailable)
 		var failure *Error
 		require.ErrorAs(t, err, &failure)
@@ -1038,6 +1039,28 @@ func TestLLMErrorBody(t *testing.T) {
 		require.NoError(t, client.Models(context.Background()))
 
 		require.Equal(t, int32(1), dials.Load())
+	})
+
+	t.Run("must_pass_same_connection_after_error_body_at_limit", func(t *testing.T) {
+		// Exactly 128 KiB: the whole body is read, and the connection goes back to the pool
+		setup(t, writeSized(128<<10))
+
+		_, err := client.Complete(context.Background(), request, func(string) error { return nil })
+		requireFailure(t, err)
+		require.NoError(t, client.Models(context.Background()))
+
+		require.Equal(t, int32(1), dials.Load())
+	})
+
+	t.Run("must_fail_error_body_one_byte_over_limit", func(t *testing.T) {
+		// 128 KiB and one byte: the body is over the limit, the connection is not reused
+		setup(t, writeSized(128<<10+1))
+
+		_, err := client.Complete(context.Background(), request, func(string) error { return nil })
+		requireFailure(t, err)
+		require.NoError(t, client.Models(context.Background()))
+
+		require.Equal(t, int32(2), dials.Load())
 	})
 
 	t.Run("must_fail_error_body_over_limit", func(t *testing.T) {

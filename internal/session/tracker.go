@@ -24,11 +24,15 @@ func (t *tracker) add() {
 	t.n++
 }
 
-// done counts one less; the waiters wake up when none is left.
+// done counts one less; the waiters wake up when none is left. Every done goes after its
+// own add: a done without add is a bug of the caller and panics with a clear message.
 func (t *tracker) done() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	if t.n <= 0 {
+		panic("session: tracker done without add")
+	}
 	t.n--
 	if t.n == 0 {
 		close(t.idle)
@@ -44,8 +48,10 @@ func (t *tracker) count() int {
 	return t.n
 }
 
-// wait waits until none is running or ctx is over; true when none is running. With none
-// running it returns at once.
+// wait waits until none is running or ctx is over. It returns true when the count has
+// gone down to zero at least once since the call, not that it is zero now: an add after
+// that starts a new round the call does not wait for. So the callers forbid new adds
+// before they wait. With none running it returns at once.
 func (t *tracker) wait(ctx context.Context) bool {
 	t.mu.Lock()
 	idle := t.idle

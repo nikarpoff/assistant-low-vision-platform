@@ -16,6 +16,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strings"
 	"time"
@@ -377,6 +378,11 @@ type stream struct {
 
 // run sends the request and reads the stream to its end, the first failure or ErrStop.
 func (s *stream) run(ctx context.Context, httpClient *http.Client, httpRequest *http.Request) error {
+	// The HTTP/1 connection of the request, to drop it after an error body over the limit
+	var conn net.Conn
+	trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { conn = info.Conn }}
+	httpRequest = httpRequest.WithContext(httptrace.WithClientTrace(httpRequest.Context(), trace))
+
 	response, err := httpClient.Do(httpRequest)
 	if err != nil {
 		return contextFailure(ctx, 0, err)
@@ -385,7 +391,13 @@ func (s *stream) run(ctx context.Context, httpClient *http.Client, httpRequest *
 
 	// Failure before the stream: status and the provider error body
 	if response.StatusCode < 200 || response.StatusCode > 299 {
-		errBody := readErrorBody(response.Body, s.cancel)
+		errBody, overLimit := readErrorBody(response.Body, s.cancel)
+		if overLimit && response.ProtoMajor == 1 && conn != nil {
+			// The transport may have pooled the connection if the extra byte was the last
+			// one. An HTTP/2 connection is shared by other requests and stays: closing the
+			// unread body resets only its stream.
+			_ = conn.Close()
+		}
 		code, traceID := parseErrorBody(errBody)
 		return &Error{Reason: reasonForStatus(response.StatusCode), StatusCode: response.StatusCode, Code: code, TraceID: traceID}
 	}
@@ -423,22 +435,27 @@ func drain(body io.Reader) {
 }
 
 // readErrorBody reads the error body of a failure before the stream and returns its
-// first maxErrorBodyBytes for parsing. The rest, up to maxErrorDrainBytes, is drained to
-// io.EOF, so the connection goes back to the pool; a longer body is left unread and the
-// connection is closed with it. When no bytes come for errorBodyIdle, cancel ends the
-// request context and the read at once: a body that stalls never delays the answer.
-func readErrorBody(body io.Reader, cancel context.CancelCauseFunc) []byte {
+// first maxErrorBodyBytes for parsing. The rest, up to maxErrorDrainBytes, is drained,
+// and one more byte is read: io.EOF right away means the body ended within the limit and
+// the connection goes back to the pool. overLimit is true when the body goes on past the
+// limit: the caller closes the connection, the rest is not read. When no bytes come for
+// errorBodyIdle, cancel ends the request context and the read at once: a body that
+// stalls never delays the answer, and the connection is closed with it.
+func readErrorBody(body io.Reader, cancel context.CancelCauseFunc) (errBody []byte, overLimit bool) {
 	timer := time.AfterFunc(errorBodyIdle, func() { cancel(errErrorBodyStalled) })
 	defer timer.Stop()
 	reader := &idleReader{reader: body, timer: timer}
 
 	errBody, err := io.ReadAll(io.LimitReader(reader, maxErrorBodyBytes))
 	if err != nil {
-		return errBody
+		return errBody, false
 	}
-	// One byte over the limit tells a body longer than the limit from one that ends at it
-	_, _ = io.Copy(io.Discard, io.LimitReader(reader, maxErrorDrainBytes+1))
-	return errBody
+	if _, err := io.Copy(io.Discard, io.LimitReader(reader, maxErrorDrainBytes)); err != nil {
+		return errBody, false
+	}
+	// One byte past the limit tells a body longer than the limit from one that ends at it
+	n, _ := io.ReadFull(reader, make([]byte, 1))
+	return errBody, n > 0
 }
 
 // idleReader restarts the idle timer after every read that brought bytes.
