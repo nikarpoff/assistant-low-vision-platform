@@ -184,7 +184,8 @@ type Dependencies struct {
 }
 
 // Pipeline runs the requests of all sessions. Its own state is the hazard cooldowns of
-// the devices and the requests in progress of the sessions (PROTO-8).
+// the devices. The slots of a session (PROTO-8) are kept by the session: the pipeline
+// runs every request it gets and never skips one.
 type Pipeline struct {
 	cfg  Config
 	deps Dependencies
@@ -193,7 +194,6 @@ type Pipeline struct {
 
 	mu        sync.Mutex
 	cooldowns map[string]*deviceCooldown // device_id -> cooldown
-	sessions  map[string]*inProgress     // session_id -> requests in progress
 }
 
 // NewPipeline creates the pipelines.
@@ -203,7 +203,6 @@ func NewPipeline(cfg Config, deps Dependencies) *Pipeline {
 		deps:      deps,
 		now:       time.Now,
 		cooldowns: map[string]*deviceCooldown{},
-		sessions:  map[string]*inProgress{},
 	}
 }
 
@@ -223,11 +222,8 @@ type DescribeRequest struct {
 // TTS and AUDIO_OUT, then answer.end with the timings. accepted is sent by the session.
 // It returns when the request is over; a cancelled request sends nothing more.
 func (p *Pipeline) Describe(ctx context.Context, req *DescribeRequest, sink Sink) {
-	release := sync.OnceFunc(p.beginUser(req.SessionID))
-	defer release()
 	r := p.newRun(ctx, KindDescribe, req.RequestID, req.SessionID, req.ReceivedAt, sink)
 	defer r.cancel()
-	r.release = release
 	r.timings.Set(StageReceive, req.ReceivedAt.Sub(req.StartedAt))
 	r.record.ImageBytes = len(req.Image)
 	r.intent = protocol.IntentDescribe
@@ -293,9 +289,6 @@ type run struct {
 	priority protocol.Priority
 	// staleAt is when a passive result gets stale (PROTO-8); zero for a user request.
 	staleAt time.Time
-	// release ends the request in the counters of its session before its last message
-	// (sendLast); idempotent, nil if the request is not counted.
-	release func()
 
 	mu             sync.Mutex
 	started        bool // answer.start is sent
@@ -554,12 +547,10 @@ func (r *run) fail(protocolErr *protocol.Error, cause error) {
 }
 
 // sendLast sends the last message of the request - answer.end, passive.clear or error.
-// The request leaves the counters of its session first: the application may send the
-// next request as soon as it gets this message, and it must not be skipped (PROTO-8).
+// The session frees the slot of the request when it gets this message, before passing it
+// on: the application may send the next request as soon as it gets the message, and it
+// must not be skipped (PROTO-8).
 func (r *run) sendLast(message protocol.Message) {
-	if r.release != nil {
-		r.release()
-	}
 	r.sink.Send(message)
 }
 

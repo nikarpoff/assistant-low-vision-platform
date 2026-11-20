@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -59,7 +60,22 @@ type harness struct {
 	cfg      Config
 }
 
+// harnessOptions changes the harness of a test.
+type harnessOptions struct {
+	// mutate changes the session config.
+	mutate func(cfg *Config)
+	// vars changes the variables of the pipelines and the clients before they are created.
+	vars func(vars *env.Vars)
+	// wrapDetector wraps the detector client the pipelines use.
+	wrapDetector func(next pipeline.ObjectDetector) pipeline.ObjectDetector
+}
+
 func newHarness(t *testing.T, mutate func(cfg *Config)) *harness {
+	t.Helper()
+	return newHarnessWith(t, harnessOptions{mutate: mutate})
+}
+
+func newHarnessWith(t *testing.T, opts harnessOptions) *harness {
 	t.Helper()
 	h := &harness{detector: servicestub.NewDetector(), tts: servicestub.NewTTS(), metrics: metrics.NewMetrics()}
 	t.Cleanup(h.detector.Close)
@@ -82,8 +98,15 @@ func newHarness(t *testing.T, mutate func(cfg *Config)) *harness {
 		AppAudioOutSampleRate:     24000,
 		AppMaxImageBytes:          testMaxImageBytes,
 	}
+	if opts.vars != nil {
+		opts.vars(vars)
+	}
 	detectorClient, err := detector.NewClient(vars, h.metrics)
 	require.NoError(t, err)
+	var objectDetector pipeline.ObjectDetector = detectorClient
+	if opts.wrapDetector != nil {
+		objectDetector = opts.wrapDetector(detectorClient)
+	}
 	ttsClient, err := tts.NewClient(vars, h.metrics)
 	require.NoError(t, err)
 
@@ -108,7 +131,7 @@ func newHarness(t *testing.T, mutate func(cfg *Config)) *harness {
 	// The session and the pipelines write to one journal, as in the gateway
 	h.recorder = &RecorderMock{WriteFunc: func(journal.Record) {}}
 	pipelines := pipeline.NewPipeline(pipeline.NewConfig(vars), pipeline.Dependencies{
-		Detector:    detectorClient,
+		Detector:    objectDetector,
 		Synthesizer: ttsClient,
 		Describer:   sceneDescriber,
 		History:     store,
@@ -119,13 +142,47 @@ func newHarness(t *testing.T, mutate func(cfg *Config)) *harness {
 	})
 
 	h.cfg = NewConfig(vars, testVersion)
-	if mutate != nil {
-		mutate(&h.cfg)
+	if opts.mutate != nil {
+		opts.mutate(&h.cfg)
 	}
 	h.server = NewServer(h.cfg, pipelines, configSource, h.recorder, h.metrics)
 	h.http = httptest.NewServer(h.server)
 	t.Cleanup(h.http.Close)
 	return h
+}
+
+// gatedDetector holds the first calls of the detector until gate is closed, whatever
+// their context: a cancelled pipeline stays in the detector as long as a test needs.
+// The next calls go to the detector it wraps.
+type gatedDetector struct {
+	next    pipeline.ObjectDetector
+	gate    chan struct{}
+	open    func()
+	held    atomic.Int32 // calls still to hold
+	arrived chan struct{}
+}
+
+func newGatedDetector(held int) *gatedDetector {
+	d := &gatedDetector{gate: make(chan struct{}), arrived: make(chan struct{}, 8)}
+	d.open = sync.OnceFunc(func() { close(d.gate) })
+	d.held.Store(int32(held))
+	return d
+}
+
+// Detect holds the call until the gate is open if it is one of the first calls; a held
+// call whose context is over by then fails with it.
+func (d *gatedDetector) Detect(ctx context.Context, requestID string, image []byte) (*detector.DetectResponse, error) {
+	if d.held.Add(-1) >= 0 {
+		select {
+		case d.arrived <- struct{}{}:
+		default:
+		}
+		<-d.gate
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return d.next.Detect(ctx, requestID, image)
 }
 
 // dial opens a session; token is empty for no Authorization header.
@@ -898,6 +955,319 @@ func TestSession_PassiveJournal(t *testing.T) {
 	})
 }
 
+func TestSession_PassiveSlots(t *testing.T) {
+	var (
+		h     *harness
+		c     *client
+		gated *gatedDetector
+	)
+
+	// stairs is a danger ahead: a passive request that runs ends with a warning.
+	stairs := detector.Object{Label: "stairs", LabelRU: "ступени", Confidence: 0.9, Direction: detector.DirectionAhead, Distance: detector.DistanceNear, Area: 0.2}
+
+	// setup holds the first held calls of the detector in gatedDetector.
+	setup := func(t *testing.T, held int) {
+		logger.InitTestLogger()
+		gated = newGatedDetector(held)
+		h = newHarnessWith(t, harnessOptions{
+			vars: func(vars *env.Vars) {
+				vars.AppPassiveDeadlineMS = 5000
+				vars.AppHazardCooldownMS = 10000
+			},
+			wrapDetector: func(next pipeline.ObjectDetector) pipeline.ObjectDetector {
+				gated.next = next
+				return gated
+			},
+		})
+		// Runs before the harness is closed: no pipeline stays in the gate
+		t.Cleanup(gated.open)
+		h.detector.SetObjects([]detector.Object{stairs})
+		c = h.open(t)
+	}
+
+	// wait waits for a signal.
+	wait := func(t *testing.T, signal <-chan struct{}, what string) {
+		t.Helper()
+		select {
+		case <-signal:
+		case <-time.After(testTimeout):
+			t.Fatalf("%s did not come", what)
+		}
+	}
+
+	// passive sends a passive describe and its snapshot.
+	passive := func(t *testing.T, id uuid.UUID) {
+		t.Helper()
+		c.send(t, fmt.Sprintf(`{"type":"describe","request_id":"%s","mode":"passive","focus":"ahead","image":{"width":640,"height":480,"bytes":%d}}`, id, len(testImage)))
+		c.sendFrame(t, protocol.EncodeFrame(&protocol.Frame{Kind: protocol.KindImageJPEG, RequestID: id, Payload: testImage}))
+	}
+
+	cancel := func(t *testing.T, id uuid.UUID) {
+		t.Helper()
+		c.send(t, fmt.Sprintf(`{"type":"cancel","request_id":"%s"}`, id))
+	}
+
+	// passiveSeq reads every message with the request_id of the passive request up to its
+	// last one: answer.end, passive.clear or error. Frames and other requests are skipped.
+	passiveSeq := func(t *testing.T, id uuid.UUID) []protocol.Message {
+		t.Helper()
+		seq := []protocol.Message{}
+		for {
+			got := c.next(t)
+			if got.frame != nil {
+				continue
+			}
+			var (
+				requestID uuid.UUID
+				last      bool
+			)
+			switch m := got.message.(type) {
+			case *protocol.Accepted:
+				requestID = m.RequestID
+			case *protocol.AnswerStart:
+				requestID = m.RequestID
+			case *protocol.AnswerText:
+				requestID = m.RequestID
+			case *protocol.AnswerEnd:
+				requestID, last = m.RequestID, true
+			case *protocol.PassiveClear:
+				requestID, last = m.RequestID, true
+			case *protocol.ErrorMessage:
+				if m.RequestID != nil {
+					requestID, last = *m.RequestID, true
+				}
+			}
+			if requestID != id {
+				continue
+			}
+			seq = append(seq, got.message)
+			if last {
+				return seq
+			}
+		}
+	}
+
+	// requireInvariant checks that the passive request got exactly one of the two (F-2):
+	// passive.clear skipped without accepted, or accepted and then its last message that
+	// is not skipped. It returns whether the request is skipped.
+	requireInvariant := func(t *testing.T, id uuid.UUID, seq []protocol.Message) bool {
+		t.Helper()
+		require.NotEmpty(t, seq)
+		accepted := 0
+		for _, m := range seq {
+			if _, ok := m.(*protocol.Accepted); ok {
+				accepted++
+			}
+		}
+		if clear, ok := seq[len(seq)-1].(*protocol.PassiveClear); ok && clear.Reason == protocol.ClearSkipped {
+			require.Zero(t, accepted, "skipped after accepted: %#v", seq)
+			require.Equal(t, []protocol.Message{&protocol.PassiveClear{RequestID: id, Reason: protocol.ClearSkipped}}, seq)
+			return true
+		}
+		require.Equal(t, 1, accepted, "%#v", seq)
+		require.Equal(t, &protocol.Accepted{RequestID: id}, seq[0])
+		require.Greater(t, len(seq), 1)
+		return false
+	}
+
+	// record waits for the journal record of the request.
+	record := func(t *testing.T, id uuid.UUID) *journal.Request {
+		t.Helper()
+		var found *journal.Request
+		require.Eventually(t, func() bool {
+			for _, call := range h.recorder.WriteCalls() {
+				if r, ok := call.Record.(*journal.Request); ok && r.RequestID == id.String() {
+					found = r
+					return true
+				}
+			}
+			return false
+		}, testTimeout, 5*time.Millisecond)
+		return found
+	}
+
+	// requireOneRecord checks that the passive request has exactly one journal record and returns it.
+	requireOneRecord := func(t *testing.T, id uuid.UUID) *journal.Request {
+		t.Helper()
+		found := record(t, id)
+		records := 0
+		for _, call := range h.recorder.WriteCalls() {
+			if r, ok := call.Record.(*journal.Request); ok && r.RequestID == id.String() {
+				records++
+			}
+		}
+		require.Equal(t, 1, records)
+		require.Equal(t, pipeline.KindPassive, found.Kind)
+		return found
+	}
+
+	// passiveCount sums alv_requests_total{kind="passive"} over all statuses.
+	passiveCount := func() float64 {
+		sum := 0.0
+		for _, status := range []string{pipeline.StatusOK, pipeline.StatusDegraded, pipeline.StatusError, pipeline.StatusCancelled,
+			pipeline.StatusSkipped, pipeline.StatusStale, pipeline.StatusClear} {
+			sum += testutil.ToFloat64(h.metrics.Requests.WithLabelValues(pipeline.KindPassive, status))
+		}
+		return sum
+	}
+
+	skippedCount := func() float64 {
+		return testutil.ToFloat64(h.metrics.Requests.WithLabelValues(pipeline.KindPassive, pipeline.StatusSkipped))
+	}
+
+	// requireRuns checks the branch of decision R-2: the passive request that came while a
+	// cancelled pipeline winds down is accepted and runs, its snapshot reaches the detector.
+	requireRuns := func(t *testing.T, id uuid.UUID, before float64) {
+		t.Helper()
+		seq := passiveSeq(t, id)
+		require.False(t, requireInvariant(t, id, seq), "the passive request is skipped: %#v", seq)
+		switch last := seq[len(seq)-1].(type) {
+		case *protocol.AnswerEnd:
+			require.IsType(t, &protocol.AnswerStart{}, seq[1])
+			require.Equal(t, protocol.AnswerKindWarning, seq[1].(*protocol.AnswerStart).Kind)
+		case *protocol.PassiveClear:
+			require.NotEqual(t, protocol.ClearSkipped, last.Reason)
+		default:
+			t.Fatalf("the passive request failed: %#v", last)
+		}
+		// The held call never reached the stub: the request seen there is the passive one
+		require.Equal(t, 1, h.detector.Requests())
+		require.NotEqual(t, pipeline.StatusSkipped, requireOneRecord(t, id).Status)
+		require.Equal(t, before+1, passiveCount())
+	}
+
+	// requireSkipped checks that the passive request got passive.clear skipped without
+	// accepted, one record skipped and one count skipped.
+	requireSkipped := func(t *testing.T, id uuid.UUID, before, beforeSkipped float64) {
+		t.Helper()
+		require.True(t, requireInvariant(t, id, passiveSeq(t, id)))
+		require.Equal(t, pipeline.StatusSkipped, requireOneRecord(t, id).Status)
+		require.Equal(t, beforeSkipped+1, skippedCount())
+		require.Equal(t, before+1, passiveCount())
+	}
+
+	t.Run("must_pass_after_user_cancel", func(t *testing.T) {
+		setup(t, 1)
+		user := uuid.New()
+		c.describe(t, user, testImage)
+		require.Equal(t, &protocol.Accepted{RequestID: user}, c.next(t).message)
+		wait(t, gated.arrived, "describe in the detector")
+
+		// The cancelled describe stays in the detector while the passive request runs
+		cancel(t, user)
+		id := uuid.New()
+		before := passiveCount()
+		passive(t, id)
+		requireRuns(t, id, before)
+
+		gated.open()
+		require.Equal(t, pipeline.StatusCancelled, record(t, user).Status)
+	})
+
+	t.Run("must_pass_after_user_replaced", func(t *testing.T) {
+		setup(t, 1)
+		user := uuid.New()
+		c.describe(t, user, testImage)
+		require.Equal(t, &protocol.Accepted{RequestID: user}, c.next(t).message)
+		wait(t, gated.arrived, "describe in the detector")
+
+		// The question takes the slot of the describe it replaced: it waits for ask.end
+		question := uuid.New()
+		c.send(t, fmt.Sprintf(`{"type":"ask.start","request_id":"%s","trigger":"hold","with_image":false}`, question))
+		id := uuid.New()
+		before, beforeSkipped := passiveCount(), skippedCount()
+		passive(t, id)
+		requireSkipped(t, id, before, beforeSkipped)
+		require.Zero(t, h.detector.Requests())
+
+		gated.open()
+		require.Equal(t, pipeline.StatusCancelled, record(t, user).Status)
+	})
+
+	t.Run("must_pass_after_passive_cancel", func(t *testing.T) {
+		setup(t, 1)
+		first := uuid.New()
+		passive(t, first)
+		require.Equal(t, &protocol.Accepted{RequestID: first}, c.next(t).message)
+		wait(t, gated.arrived, "passive request in the detector")
+
+		cancel(t, first)
+		id := uuid.New()
+		before := passiveCount()
+		passive(t, id)
+		requireRuns(t, id, before)
+
+		gated.open()
+		require.Equal(t, pipeline.StatusCancelled, record(t, first).Status)
+		require.Equal(t, before+2, passiveCount())
+	})
+
+	t.Run("must_fail_busy_user_describe", func(t *testing.T) {
+		setup(t, 0)
+		h.detector.Hold(true)
+		user := uuid.New()
+		c.describe(t, user, testImage)
+		require.Equal(t, &protocol.Accepted{RequestID: user}, c.next(t).message)
+		wait(t, h.detector.Arrived(), "describe in the detector")
+
+		id := uuid.New()
+		before, beforeSkipped := passiveCount(), skippedCount()
+		passive(t, id)
+		requireSkipped(t, id, before, beforeSkipped)
+		require.Equal(t, 1, h.detector.Requests())
+
+		cancel(t, user)
+		require.Equal(t, pipeline.StatusCancelled, record(t, user).Status)
+	})
+
+	t.Run("must_fail_busy_passive", func(t *testing.T) {
+		setup(t, 0)
+		h.detector.Hold(true)
+		first := uuid.New()
+		passive(t, first)
+		require.Equal(t, &protocol.Accepted{RequestID: first}, c.next(t).message)
+		wait(t, h.detector.Arrived(), "passive request in the detector")
+
+		id := uuid.New()
+		before, beforeSkipped := passiveCount(), skippedCount()
+		passive(t, id)
+		requireSkipped(t, id, before, beforeSkipped)
+		require.Equal(t, 1, h.detector.Requests())
+
+		cancel(t, first)
+		require.Equal(t, pipeline.StatusCancelled, record(t, first).Status)
+	})
+
+	t.Run("must_pass_free_after_busy", func(t *testing.T) {
+		setup(t, 0)
+		h.detector.Hold(true)
+		user := uuid.New()
+		c.describe(t, user, testImage)
+		require.Equal(t, &protocol.Accepted{RequestID: user}, c.next(t).message)
+		wait(t, h.detector.Arrived(), "describe in the detector")
+		skipped := uuid.New()
+		before, beforeSkipped := passiveCount(), skippedCount()
+		passive(t, skipped)
+		requireSkipped(t, skipped, before, beforeSkipped)
+
+		// The request in the detector is over: the next passive request runs
+		cancel(t, user)
+		require.Equal(t, pipeline.StatusCancelled, record(t, user).Status)
+		h.detector.Hold(false)
+		id := uuid.New()
+		before = passiveCount()
+		passive(t, id)
+		seq := passiveSeq(t, id)
+
+		require.False(t, requireInvariant(t, id, seq))
+		require.Equal(t, protocol.AnswerKindWarning, seq[1].(*protocol.AnswerStart).Kind)
+		require.Equal(t, protocol.PriorityHigh, seq[1].(*protocol.AnswerStart).Priority)
+		require.IsType(t, &protocol.AnswerEnd{}, seq[len(seq)-1])
+		require.Equal(t, pipeline.StatusOK, requireOneRecord(t, id).Status)
+		require.Equal(t, before+1, passiveCount())
+	})
+}
+
 func TestSession_Ignored(t *testing.T) {
 	var (
 		s *Session
@@ -919,6 +1289,61 @@ func TestSession_Ignored(t *testing.T) {
 		require.Len(t, s.ignoredOrder, maxIgnored)
 		require.False(t, s.ignored[ids[0]])
 		require.True(t, s.ignored[ids[maxIgnored]])
+	})
+
+	t.Run("must_pass_snapshot_forgets", func(t *testing.T) {
+		setup()
+		first, middle, last := uuid.New(), uuid.New(), uuid.New()
+		for _, id := range []uuid.UUID{first, middle, last} {
+			s.ignore(id)
+		}
+
+		s.onImage(&protocol.Frame{Kind: protocol.KindImageJPEG, RequestID: middle, Payload: testImage})
+
+		require.Equal(t, map[uuid.UUID]bool{first: true, last: true}, s.ignored)
+		require.Equal(t, []uuid.UUID{first, last}, s.ignoredOrder)
+	})
+
+	t.Run("must_pass_bounded_after_snapshot", func(t *testing.T) {
+		setup()
+		ids := make([]uuid.UUID, maxIgnored)
+		for i := range ids {
+			ids[i] = uuid.New()
+			s.ignore(ids[i])
+		}
+
+		// The snapshot of a skipped request frees its place: the next one evicts nothing
+		s.onImage(&protocol.Frame{Kind: protocol.KindImageJPEG, RequestID: ids[maxIgnored/2], Payload: testImage})
+		next := uuid.New()
+		s.ignore(next)
+
+		require.True(t, s.ignored[ids[0]])
+		require.True(t, s.ignored[next])
+		require.False(t, s.ignored[ids[maxIgnored/2]])
+		require.Len(t, s.ignored, maxIgnored)
+		require.Len(t, s.ignoredOrder, maxIgnored)
+		require.Equal(t, ids[0], s.ignoredOrder[0])
+	})
+
+	t.Run("must_fail_second_snapshot_unexpected_image", func(t *testing.T) {
+		logger.InitTestLogger()
+		h := newHarness(t, nil)
+		c := h.open(t)
+		// A question in progress: the passive request is skipped
+		question := uuid.New()
+		c.send(t, fmt.Sprintf(`{"type":"ask.start","request_id":"%s","trigger":"hold","with_image":false}`, question))
+		id := uuid.New()
+		c.send(t, fmt.Sprintf(`{"type":"describe","request_id":"%s","mode":"passive","focus":"ahead","image":{"width":640,"height":480,"bytes":%d}}`, id, len(testImage)))
+		require.Equal(t, &protocol.PassiveClear{RequestID: id, Reason: protocol.ClearSkipped}, c.next(t).message)
+		snapshot := protocol.EncodeFrame(&protocol.Frame{Kind: protocol.KindImageJPEG, RequestID: id, Payload: testImage})
+
+		// The first snapshot is dropped silently: the next message is the answer to the probe
+		c.sendFrame(t, snapshot)
+		c.send(t, testHello)
+		require.Equal(t, &protocol.ErrorMessage{Code: protocol.CodeBadRequest, Message: errHelloRepeated}, c.nextError(t))
+		c.sendFrame(t, snapshot)
+
+		require.Equal(t, &protocol.ErrorMessage{RequestID: &id, Code: protocol.CodeBadRequest, Message: errUnexpectedImage}, c.nextError(t))
 	})
 }
 
