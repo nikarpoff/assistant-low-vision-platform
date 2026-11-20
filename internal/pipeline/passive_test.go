@@ -178,50 +178,6 @@ func TestPassive(t *testing.T) {
 		require.Equal(t, StatusStale, tp.lastRecord(t).Status)
 	})
 
-	t.Run("must_pass_skipped", func(t *testing.T) {
-		setup(pipelineOptions{})
-		tp.detector.SetObjects([]detector.Object{stairsNearAhead})
-		tp.detector.Hold(true)
-
-		// A passive request in progress: the next one of the session is skipped
-		ctx, cancel := context.WithCancelCause(context.Background())
-		first := &recordingSink{}
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			tp.pipeline.Passive(ctx, &PassiveRequest{RequestID: uuid.New(), SessionID: testSessionID, DeviceID: testDeviceID, Image: testImage, StartedAt: time.Now(), ReceivedAt: time.Now()}, first)
-		}()
-		<-tp.detector.Arrived()
-		sink := &recordingSink{}
-		tp.passive(t, context.Background(), sink, time.Now())
-		requireClear(t, sink, protocol.ClearSkipped)
-		require.Equal(t, StatusSkipped, tp.lastRecord(t).Status)
-		require.Equal(t, 1, tp.detector.Requests())
-		cancel(ErrCancelled)
-		wait(t, done, "passive")
-		require.Empty(t, first.messages())
-
-		// A user request in progress: the passive request is skipped too
-		ctx, cancel = context.WithCancelCause(context.Background())
-		done = make(chan struct{})
-		go func() {
-			defer close(done)
-			tp.pipeline.Describe(ctx, &DescribeRequest{RequestID: uuid.New(), SessionID: testSessionID, DeviceID: testDeviceID, Focus: protocol.FocusAll, Image: testImage, StartedAt: time.Now(), ReceivedAt: time.Now()}, &recordingSink{})
-		}()
-		<-tp.detector.Arrived()
-		sink = &recordingSink{}
-		tp.passive(t, context.Background(), sink, time.Now())
-		requireClear(t, sink, protocol.ClearSkipped)
-		cancel(ErrCancelled)
-		wait(t, done, "describe")
-
-		// Nothing is in progress any more: the passive request runs
-		tp.detector.Hold(false)
-		sink = &recordingSink{}
-		tp.passive(t, context.Background(), sink, time.Now())
-		requireWarning(t, sink, protocol.PriorityHigh, "Осторожно, впереди ступени.")
-	})
-
 	t.Run("must_pass_notice_flag", func(t *testing.T) {
 		setup(pipelineOptions{})
 

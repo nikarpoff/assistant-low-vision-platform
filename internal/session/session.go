@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -104,7 +104,7 @@ type Session struct {
 	out       chan outbound
 	closed    chan struct{}
 	closeOnce sync.Once
-	active    atomic.Int32 // requests whose pipeline is running
+	requests  tracker // requests whose pipeline is running
 
 	// hello, ignored, ignoredOrder, kinds and kindOrder belong to the reader goroutine.
 	hello        *protocol.Hello
@@ -177,14 +177,13 @@ func (s *Session) run() {
 
 // waitRequests waits until the cancelled pipelines of the session return, at most
 // drainTimeout: their journal records come before the end of the session and before
-// the journal is stopped on shutdown (PLT-11).
+// the journal is stopped on shutdown (PLT-11). It returns as soon as the last pipeline
+// returns, at once if none is running.
 func (s *Session) waitRequests() {
-	deadline := time.Now().Add(drainTimeout)
-	for s.active.Load() > 0 && time.Now().Before(deadline) {
-		time.Sleep(shutdownPoll)
-	}
-	if active := s.active.Load(); active > 0 {
-		logger.Warning("session closed with requests still running: session_id=%s requests=%d", s.id, active)
+	ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+	defer cancel()
+	if !s.requests.wait(ctx) {
+		logger.Warning("session closed with requests still running: session_id=%s requests=%d", s.id, s.requests.count())
 	}
 }
 
@@ -398,7 +397,10 @@ func (s *Session) onDescribe(m *protocol.Describe) {
 }
 
 // onPassive starts a passive request unless a user or a passive request is in progress:
-// then the answer is passive.clear with the reason skipped (PROTO-8).
+// then the answer is passive.clear with the reason skipped (PROTO-8). It is the only place
+// that decides whether a passive request is skipped, and it decides before accepted, so a
+// passive request never gets both. A slot is free from the cancel of its request or its
+// replacement by a new user request on, even while the cancelled pipeline still winds down.
 func (s *Session) onPassive(m *protocol.Describe) {
 	s.mu.Lock()
 	busy := s.user != nil || s.passive != nil
@@ -467,7 +469,7 @@ func (s *Session) onAskStart(m *protocol.AskStart) {
 		Image:     r.image,
 		End:       r.end,
 	}
-	s.start(r, func(ctx context.Context, sink pipeline.Sink) {
+	s.start(r, false, func(ctx context.Context, sink pipeline.Sink) {
 		s.server.pipelines.Ask(ctx, request, sink)
 	})
 }
@@ -547,6 +549,9 @@ func (s *Session) handleFrame(data []byte) {
 func (s *Session) onImage(frame *protocol.Frame) {
 	if s.ignored[frame.RequestID] {
 		delete(s.ignored, frame.RequestID)
+		if i := slices.Index(s.ignoredOrder, frame.RequestID); i >= 0 {
+			s.ignoredOrder = slices.Delete(s.ignoredOrder, i, i+1)
+		}
 		return
 	}
 	r := s.find(frame.RequestID)
@@ -563,7 +568,6 @@ func (s *Session) onImage(frame *protocol.Frame) {
 		r.image <- image
 		close(r.image)
 	case pipeline.KindPassive:
-		s.send(r, &protocol.Accepted{RequestID: r.id})
 		request := &pipeline.PassiveRequest{
 			RequestID:  r.id,
 			SessionID:  s.id.String(),
@@ -572,11 +576,10 @@ func (s *Session) onImage(frame *protocol.Frame) {
 			StartedAt:  r.startedAt,
 			ReceivedAt: received,
 		}
-		s.start(r, func(ctx context.Context, sink pipeline.Sink) {
+		s.start(r, true, func(ctx context.Context, sink pipeline.Sink) {
 			s.server.pipelines.Passive(ctx, request, sink)
 		})
 	default:
-		s.send(r, &protocol.Accepted{RequestID: r.id})
 		request := &pipeline.DescribeRequest{
 			RequestID:  r.id,
 			SessionID:  s.id.String(),
@@ -586,7 +589,7 @@ func (s *Session) onImage(frame *protocol.Frame) {
 			StartedAt:  r.startedAt,
 			ReceivedAt: received,
 		}
-		s.start(r, func(ctx context.Context, sink pipeline.Sink) {
+		s.start(r, true, func(ctx context.Context, sink pipeline.Sink) {
 			s.server.pipelines.Describe(ctx, request, sink)
 		})
 	}
@@ -621,18 +624,26 @@ func (s *Session) newRequest(id uuid.UUID, kind string) *request {
 	}
 }
 
-// start runs the pipeline of the request. While the server shuts down, no request
-// starts: the answer is busy.
-func (s *Session) start(r *request, run func(ctx context.Context, sink pipeline.Sink)) {
-	if s.server.registry.Closing() {
+// start runs the pipeline of the request; with accepted, accepted is queued first. While
+// the server shuts down, no request starts: the answer is busy.
+//
+// The order is fixed: the request is counted by the shutdown and the session, then
+// accepted is queued, then the pipeline runs. A shutdown that comes after accepted
+// always sees the request and waits for it, so the request is not cut off by the close.
+func (s *Session) start(r *request, accepted bool, run func(ctx context.Context, sink pipeline.Sink)) {
+	if !s.server.registry.beginRequest() {
 		s.reject(r, protocol.NewError(protocol.CodeBusy, errShuttingDownRequests))
 		return
 	}
-
+	s.requests.add()
 	r.running = true
-	s.active.Add(1)
+
+	if accepted {
+		s.send(r, &protocol.Accepted{RequestID: r.id})
+	}
 	go func() {
-		defer s.active.Add(-1)
+		defer s.server.registry.endRequest()
+		defer s.requests.done()
 
 		run(r.ctx, &sink{session: s, request: r})
 
@@ -656,10 +667,14 @@ func (s *Session) release(r *request) {
 	}
 }
 
-// ignore remembers a skipped passive request, so its snapshot is dropped silently; the
-// oldest is forgotten beyond maxIgnored.
+// ignore remembers a skipped passive request, so its snapshot is dropped silently. Only
+// the requests whose snapshot is still to come are kept: with maxIgnored of them the
+// oldest is forgotten.
 func (s *Session) ignore(id uuid.UUID) {
-	if len(s.ignoredOrder) == maxIgnored {
+	if s.ignored[id] {
+		return
+	}
+	if len(s.ignored) == maxIgnored {
 		delete(s.ignored, s.ignoredOrder[0])
 		s.ignoredOrder = s.ignoredOrder[1:]
 	}

@@ -3,7 +3,6 @@ package pipeline
 import (
 	"context"
 	"errors"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -70,9 +69,6 @@ type detection struct {
 // scene of the device younger than APP_SCENE_FRESHNESS_MS, otherwise the history alone.
 // accepted is sent by the session at ask.end.
 func (p *Pipeline) Ask(ctx context.Context, req *AskRequest, sink Sink) {
-	release := sync.OnceFunc(p.beginUser(req.SessionID))
-	defer release()
-
 	detected := make(chan detection, 1)
 	go p.detectQuestion(ctx, req, detected)
 
@@ -86,7 +82,6 @@ func (p *Pipeline) Ask(ctx context.Context, req *AskRequest, sink Sink) {
 
 	r := p.newRun(ctx, KindAsk, req.RequestID, req.SessionID, end.ReceivedAt, sink)
 	defer r.cancel()
-	r.release = release
 
 	transcript, ok := p.recognize(r, end.Audio)
 	if !ok {
