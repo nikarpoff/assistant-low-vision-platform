@@ -68,6 +68,10 @@ type harnessOptions struct {
 	vars func(vars *env.Vars)
 	// wrapDetector wraps the detector client the pipelines use.
 	wrapDetector func(next pipeline.ObjectDetector) pipeline.ObjectDetector
+	// write is called for every journal record of the sessions and the pipelines.
+	write func(record journal.Record)
+	// pipelines replaces the real pipelines of the sessions.
+	pipelines Pipelines
 }
 
 func newHarness(t *testing.T, mutate func(cfg *Config)) *harness {
@@ -130,6 +134,9 @@ func newHarnessWith(t *testing.T, opts harnessOptions) *harness {
 
 	// The session and the pipelines write to one journal, as in the gateway
 	h.recorder = &RecorderMock{WriteFunc: func(journal.Record) {}}
+	if opts.write != nil {
+		h.recorder.WriteFunc = opts.write
+	}
 	pipelines := pipeline.NewPipeline(pipeline.NewConfig(vars), pipeline.Dependencies{
 		Detector:    objectDetector,
 		Synthesizer: ttsClient,
@@ -145,7 +152,11 @@ func newHarnessWith(t *testing.T, opts harnessOptions) *harness {
 	if opts.mutate != nil {
 		opts.mutate(&h.cfg)
 	}
-	h.server = NewServer(h.cfg, pipelines, configSource, h.recorder, h.metrics)
+	var sessionPipelines Pipelines = pipelines
+	if opts.pipelines != nil {
+		sessionPipelines = opts.pipelines
+	}
+	h.server = NewServer(h.cfg, sessionPipelines, configSource, h.recorder, h.metrics)
 	h.http = httptest.NewServer(h.server)
 	t.Cleanup(h.http.Close)
 	return h
@@ -607,7 +618,10 @@ func TestSession_Cancel(t *testing.T) {
 		require.False(t, end.Degraded)
 		require.Eventually(t, func() bool { return h.tts.Cancelled() >= 1 }, testTimeout, 5*time.Millisecond)
 		require.Eventually(t, func() bool { return cancelled() == 1 }, testTimeout, 5*time.Millisecond)
-		require.Equal(t, 1.0, testutil.ToFloat64(h.metrics.Requests.WithLabelValues(pipeline.KindDescribe, pipeline.StatusOK)))
+		// The pipeline counts the request after its last message, so the counter is waited for
+		require.Eventually(t, func() bool {
+			return testutil.ToFloat64(h.metrics.Requests.WithLabelValues(pipeline.KindDescribe, pipeline.StatusOK)) == 1.0
+		}, 2*time.Second, 5*time.Millisecond)
 	})
 
 	t.Run("must_pass_cancel_before_snapshot", func(t *testing.T) {
@@ -1620,5 +1634,238 @@ func TestSession_CloseJournal(t *testing.T) {
 		requireCancelledShutdown(detecting, pipeline.KindDescribe)
 		requireCancelledShutdown(waiting, pipeline.KindPassive)
 		require.NotContains(t, getLogs(), "request failed")
+	})
+}
+
+// timedJournal keeps the journal records with the moments they were written.
+type timedJournal struct {
+	mu      sync.Mutex
+	records []timedRecord
+}
+
+// timedRecord is a journal record and the moment it was written.
+type timedRecord struct {
+	record journal.Record
+	at     time.Time
+}
+
+func (j *timedJournal) write(record journal.Record) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	j.records = append(j.records, timedRecord{record: record, at: time.Now()})
+}
+
+// request returns the position and the record of the request; -1 if there is none.
+func (j *timedJournal) request(id uuid.UUID) (int, *journal.Request, time.Time) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	for i, r := range j.records {
+		if record, ok := r.record.(*journal.Request); ok && record.RequestID == id.String() {
+			return i, record, r.at
+		}
+	}
+	return -1, nil, time.Time{}
+}
+
+// sessionEnd returns the position and the moment of the end of the session; -1 if there is none.
+func (j *timedJournal) sessionEnd() (int, time.Time) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	for i, r := range j.records {
+		if _, ok := r.record.(*journal.SessionEnd); ok {
+			return i, r.at
+		}
+	}
+	return -1, time.Time{}
+}
+
+func TestSession_ShutdownWait(t *testing.T) {
+	var (
+		h       *harness
+		records *timedJournal
+		getLogs func() string
+	)
+
+	setup := func(grace time.Duration) {
+		getLogs = logger.InitTestLogger()
+		records = &timedJournal{}
+		h = newHarnessWith(t, harnessOptions{
+			mutate: func(cfg *Config) { cfg.ShutdownGrace = grace },
+			write:  records.write,
+		})
+	}
+
+	// questionWaiting opens a session with a question waiting for ask.end.
+	questionWaiting := func(t *testing.T) uuid.UUID {
+		t.Helper()
+		c := h.open(t)
+		id := uuid.New()
+		c.send(t, fmt.Sprintf(`{"type":"ask.start","request_id":"%s","trigger":"hold","with_image":false}`, id))
+		require.Eventually(t, func() bool { return h.server.registry.activeRequests() == 1 }, testTimeout, time.Millisecond)
+		return id
+	}
+
+	// requireRecorded checks that by the return of Shutdown the question is recorded as
+	// cancelled before the end of the session.
+	requireRecorded := func(t *testing.T, id uuid.UUID) {
+		t.Helper()
+		requestAt, record, _ := records.request(id)
+		endAt, _ := records.sessionEnd()
+		require.GreaterOrEqual(t, requestAt, 0)
+		require.GreaterOrEqual(t, endAt, 0)
+		require.Less(t, requestAt, endAt)
+		require.Equal(t, pipeline.StatusCancelled, record.Status)
+	}
+
+	t.Run("must_pass_returns_when_requests_end", func(t *testing.T) {
+		setup(5 * time.Second)
+		c := h.open(t)
+		h.tts.ChunkPause(100 * time.Millisecond)
+		id := uuid.New()
+		c.describe(t, id, testImage)
+		require.Equal(t, &protocol.Accepted{RequestID: id}, c.next(t).message)
+		returned := make(chan time.Time, 1)
+
+		go func() {
+			h.server.Shutdown(context.Background())
+			returned <- time.Now()
+		}()
+		all := c.until(t, id)
+		endedAt := time.Now()
+		_, _, err := c.conn.ReadMessage()
+		var returnedAt time.Time
+		select {
+		case returnedAt = <-returned:
+		case <-time.After(testTimeout):
+			t.Fatal("Shutdown did not return")
+		}
+
+		require.IsType(t, &protocol.AnswerEnd{}, all[len(all)-1].message)
+		var closeErr *websocket.CloseError
+		require.True(t, errors.As(err, &closeErr), err)
+		require.Equal(t, websocket.CloseGoingAway, closeErr.Code)
+		require.Less(t, returnedAt.Sub(endedAt), 2*time.Second)
+	})
+
+	t.Run("must_pass_no_sessions", func(t *testing.T) {
+		setup(5 * time.Second)
+
+		started := time.Now()
+		h.server.Shutdown(context.Background())
+
+		require.Less(t, time.Since(started), 100*time.Millisecond)
+	})
+
+	t.Run("must_pass_grace_expired", func(t *testing.T) {
+		setup(200 * time.Millisecond)
+		id := questionWaiting(t)
+
+		started := time.Now()
+		h.server.Shutdown(context.Background())
+		elapsed := time.Since(started)
+
+		require.GreaterOrEqual(t, elapsed, 200*time.Millisecond)
+		require.LessOrEqual(t, elapsed, 1200*time.Millisecond)
+		require.Contains(t, getLogs(), "shutdown grace period is over")
+		requireRecorded(t, id)
+	})
+
+	t.Run("must_pass_context_cancelled", func(t *testing.T) {
+		setup(5 * time.Second)
+		id := questionWaiting(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cancelled := make(chan time.Time, 1)
+
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			cancelled <- time.Now()
+			cancel()
+		}()
+		h.server.Shutdown(ctx)
+		returnedAt := time.Now()
+
+		require.LessOrEqual(t, returnedAt.Sub(<-cancelled), time.Second)
+		requireRecorded(t, id)
+	})
+}
+
+func TestSession_DrainWait(t *testing.T) {
+	var (
+		h       *harness
+		records *timedJournal
+		getLogs func() string
+	)
+
+	setup := func(opts harnessOptions) {
+		getLogs = logger.InitTestLogger()
+		records = &timedJournal{}
+		opts.write = records.write
+		h = newHarnessWith(t, opts)
+	}
+
+	// sessionEnded waits for the end of the session and returns its position and moment.
+	sessionEnded := func(t *testing.T) (int, time.Time) {
+		t.Helper()
+		require.Eventually(t, func() bool {
+			i, _ := records.sessionEnd()
+			return i >= 0
+		}, testTimeout, time.Millisecond)
+		return records.sessionEnd()
+	}
+
+	t.Run("must_pass_session_end_after_pipelines", func(t *testing.T) {
+		gated := newGatedDetector(1)
+		t.Cleanup(gated.open)
+		setup(harnessOptions{wrapDetector: func(next pipeline.ObjectDetector) pipeline.ObjectDetector {
+			gated.next = next
+			return gated
+		}})
+		c := h.open(t)
+		id := uuid.New()
+		c.describe(t, id, testImage)
+		<-gated.arrived
+
+		// The connection is lost while the pipeline is in the detector, which holds it
+		require.NoError(t, c.conn.Close())
+		time.Sleep(300 * time.Millisecond)
+		opened := time.Now()
+		gated.open()
+
+		endAt, endedAt := sessionEnded(t)
+		requestAt, record, recordedAt := records.request(id)
+		require.GreaterOrEqual(t, requestAt, 0)
+		require.Less(t, requestAt, endAt)
+		require.Equal(t, pipeline.StatusCancelled, record.Status)
+		require.False(t, recordedAt.Before(opened))
+		require.LessOrEqual(t, endedAt.Sub(recordedAt), time.Second)
+		require.NotContains(t, getLogs(), "session closed with requests still running")
+	})
+
+	t.Run("must_fail_pipeline_stuck", func(t *testing.T) {
+		release := make(chan struct{})
+		t.Cleanup(func() { close(release) })
+		arrived := make(chan struct{}, 1)
+		stuck := &PipelinesMock{DescribeFunc: func(ctx context.Context, req *pipeline.DescribeRequest, sink pipeline.Sink) {
+			arrived <- struct{}{}
+			// The pipeline does not return after the cancellation
+			<-release
+		}}
+		setup(harnessOptions{pipelines: stuck})
+		c := h.open(t)
+		c.describe(t, uuid.New(), testImage)
+		<-arrived
+
+		closedAt := time.Now()
+		require.NoError(t, c.conn.Close())
+
+		_, endedAt := sessionEnded(t)
+		waited := endedAt.Sub(closedAt)
+		require.GreaterOrEqual(t, waited, drainTimeout)
+		require.LessOrEqual(t, waited, drainTimeout+time.Second)
+		require.Contains(t, getLogs(), "session closed with requests still running")
 	})
 }
