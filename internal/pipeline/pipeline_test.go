@@ -383,8 +383,9 @@ func TestSentenceStreaming(t *testing.T) {
 	t.Run("must_pass_audio_in_order", func(t *testing.T) {
 		setup(220)
 		sentences := []string{"Осторожно, впереди близко ступени.", "Слева стул, далеко.", "Справа дверь, близко."}
-		// The first sentence is synthesized the slowest: its audio still goes first.
-		tp.tts.Delay(sentences[0], 150*time.Millisecond)
+		// The first synthesis waits until the second one comes: the two are surely
+		// active at once, and the first audio still goes first.
+		tp.tts.GateFirst(true)
 		script = func(_ context.Context, onText llm.TextHandler) (*llm.Result, error) {
 			return streamPieces(onText, sentences[0]+" ", sentences[1]+" ", sentences[2])
 		}

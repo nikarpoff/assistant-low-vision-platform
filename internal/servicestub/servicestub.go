@@ -280,6 +280,8 @@ type TTS struct {
 	times       []time.Time
 	delays      map[string]time.Duration
 	holdFirst   bool
+	gateFirst   bool
+	second      chan struct{}
 	fail        bool
 	active      int
 	maxActive   int
@@ -294,6 +296,7 @@ func NewTTS() *TTS {
 		info:    mustRead("tts-service", "info.response.json"),
 		delays:  map[string]time.Duration{},
 		arrived: make(chan string, 64),
+		second:  make(chan struct{}),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(pathSynthesize, t.synthesize)
@@ -331,6 +334,15 @@ func (t *TTS) HoldFirst(hold bool) {
 	defer t.mu.Unlock()
 
 	t.holdFirst = hold
+}
+
+// GateFirst makes the first synthesis wait before its first chunk until the second
+// synthesis comes, so the two are surely active at once.
+func (t *TTS) GateFirst(gate bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.gateFirst = gate
 }
 
 // Fail makes every synthesis answer 503.
@@ -401,6 +413,10 @@ func (t *TTS) synthesize(w http.ResponseWriter, r *http.Request) {
 	t.texts = append(t.texts, request.Text)
 	t.times = append(t.times, time.Now())
 	hold := first && t.holdFirst
+	gate := first && t.gateFirst
+	if len(t.texts) == 2 {
+		close(t.second)
+	}
 	fail := t.fail
 	delay := t.delays[request.Text]
 	pause := t.chunkPauses
@@ -419,6 +435,9 @@ func (t *TTS) synthesize(w http.ResponseWriter, r *http.Request) {
 
 	if fail {
 		writeError(w, http.StatusServiceUnavailable)
+		return
+	}
+	if gate && !t.waitSecond(r) {
 		return
 	}
 	if !t.wait(r, delay) {
@@ -450,6 +469,22 @@ func (t *TTS) synthesize(w http.ResponseWriter, r *http.Request) {
 			t.wait(r, holdLimit)
 			return
 		}
+	}
+}
+
+// waitSecond pauses until the second synthesis comes; false if the client gave the
+// request up meanwhile or the second one never came within holdLimit.
+func (t *TTS) waitSecond(r *http.Request) bool {
+	select {
+	case <-t.second:
+		return true
+	case <-r.Context().Done():
+		t.mu.Lock()
+		t.cancelled++
+		t.mu.Unlock()
+		return false
+	case <-time.After(holdLimit):
+		return false
 	}
 }
 
