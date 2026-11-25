@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -974,7 +975,6 @@ func TestLLMErrorBody(t *testing.T) {
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
 			writeBody(w)
 		}))
 		server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
@@ -1015,10 +1015,28 @@ func TestLLMErrorBody(t *testing.T) {
 		require.NotContains(t, getLogs(), "Ошибка поставщика")
 	}
 
+	// writeSized writes the 503 answer with an error body of size bytes; a body longer
+	// than the server buffer goes chunked, without Content-Length
 	writeSized := func(size int) func(w http.ResponseWriter) {
 		return func(w http.ResponseWriter) {
+			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = io.WriteString(w, paddedBody(size))
 		}
+	}
+
+	// writeLength writes the same answer with an explicit Content-Length, the whole body at once
+	writeLength := func(size int) func(w http.ResponseWriter) {
+		return func(w http.ResponseWriter) {
+			w.Header().Set("Content-Length", strconv.Itoa(size))
+			writeSized(size)(w)
+		}
+	}
+
+	// probeBody wraps the transport of the client to watch the body of the error answer
+	probeBody := func() *bodyProbe {
+		probe := &bodyProbe{base: client.httpClient.Transport}
+		client.httpClient.Transport = probe
+		return probe
 	}
 
 	t.Run("must_pass_same_connection_after_short_error_body", func(t *testing.T) {
@@ -1076,6 +1094,7 @@ func TestLLMErrorBody(t *testing.T) {
 	t.Run("must_fail_error_body_never_ends", func(t *testing.T) {
 		release := make(chan struct{})
 		setup(t, func(w http.ResponseWriter) {
+			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = io.WriteString(w, paddedBody(100<<10))
 			w.(http.Flusher).Flush()
 			<-release
@@ -1089,4 +1108,99 @@ func TestLLMErrorBody(t *testing.T) {
 		requireFailure(t, err)
 		require.Less(t, elapsed, time.Second)
 	})
+
+	t.Run("must_fail_error_body_length_one_byte_over_limit", func(t *testing.T) {
+		// Content-Length of 128 KiB and one byte: only the start is read, the connection is not reused
+		setup(t, writeLength(128<<10+1))
+		probe := probeBody()
+
+		_, err := client.Complete(context.Background(), request, func(string) error { return nil })
+
+		require.Equal(t, int64(128<<10+1), probe.contentLength.Load())
+		requireFailure(t, err)
+		require.LessOrEqual(t, probe.read.Load(), int64(64<<10))
+		require.True(t, probe.closed.Load())
+		require.NoError(t, client.Models(context.Background()))
+		require.Equal(t, int32(2), dials.Load())
+	})
+
+	t.Run("must_fail_error_body_length_over_limit", func(t *testing.T) {
+		setup(t, writeLength(1<<20))
+		probe := probeBody()
+
+		_, err := client.Complete(context.Background(), request, func(string) error { return nil })
+
+		require.Equal(t, int64(1<<20), probe.contentLength.Load())
+		requireFailure(t, err)
+		require.LessOrEqual(t, probe.read.Load(), int64(64<<10))
+		require.True(t, probe.closed.Load())
+		require.NoError(t, client.Models(context.Background()))
+		require.Equal(t, int32(2), dials.Load())
+	})
+
+	t.Run("must_pass_same_connection_after_error_body_length_at_limit", func(t *testing.T) {
+		// Content-Length of exactly 128 KiB: the whole body is read, and the connection goes back to the pool
+		setup(t, writeLength(128<<10))
+		probe := probeBody()
+
+		_, err := client.Complete(context.Background(), request, func(string) error { return nil })
+
+		require.Equal(t, int64(128<<10), probe.contentLength.Load())
+		requireFailure(t, err)
+		require.Equal(t, int64(128<<10), probe.read.Load())
+		require.NoError(t, client.Models(context.Background()))
+		require.Equal(t, int32(1), dials.Load())
+	})
+
+	t.Run("must_fail_error_body_unknown_length_one_byte_over_limit", func(t *testing.T) {
+		// Chunked, 128 KiB and one byte: the path of v0.1.1, the connection is closed
+		setup(t, writeSized(128<<10+1))
+		probe := probeBody()
+
+		_, err := client.Complete(context.Background(), request, func(string) error { return nil })
+
+		require.Equal(t, int64(-1), probe.contentLength.Load())
+		requireFailure(t, err)
+		require.NoError(t, client.Models(context.Background()))
+		require.Equal(t, int32(2), dials.Load())
+	})
+}
+
+// bodyProbe wraps a transport and watches the body of the /chat/completions answer:
+// its ContentLength, the bytes the client read from it and whether the client closed it.
+type bodyProbe struct {
+	base          http.RoundTripper
+	contentLength atomic.Int64
+	read          atomic.Int64
+	closed        atomic.Bool
+}
+
+// RoundTrip sends the request over the wrapped transport and wraps the answer body.
+func (p *bodyProbe) RoundTrip(r *http.Request) (*http.Response, error) {
+	response, err := p.base.RoundTrip(r)
+	if err != nil || !strings.HasSuffix(r.URL.Path, pathChatCompletions) {
+		return response, err
+	}
+	p.contentLength.Store(response.ContentLength)
+	response.Body = &probedBody{body: response.Body, probe: p}
+	return response, nil
+}
+
+// probedBody counts the bytes read from the body and notes its Close.
+type probedBody struct {
+	body  io.ReadCloser
+	probe *bodyProbe
+}
+
+// Read reads from the body and counts the bytes.
+func (b *probedBody) Read(p []byte) (int, error) {
+	n, err := b.body.Read(p)
+	b.probe.read.Add(int64(n))
+	return n, err
+}
+
+// Close closes the body and notes it.
+func (b *probedBody) Close() error {
+	b.probe.closed.Store(true)
+	return b.body.Close()
 }

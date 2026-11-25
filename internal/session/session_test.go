@@ -999,16 +999,6 @@ func TestSession_PassiveSlots(t *testing.T) {
 		c = h.open(t)
 	}
 
-	// wait waits for a signal.
-	wait := func(t *testing.T, signal <-chan struct{}, what string) {
-		t.Helper()
-		select {
-		case <-signal:
-		case <-time.After(testTimeout):
-			t.Fatalf("%s did not come", what)
-		}
-	}
-
 	// passive sends a passive describe and its snapshot.
 	passive := func(t *testing.T, id uuid.UUID) {
 		t.Helper()
@@ -1646,6 +1636,16 @@ func TestSession_CloseJournal(t *testing.T) {
 	})
 }
 
+// wait waits for a signal no longer than testTimeout.
+func wait(t *testing.T, signal <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(testTimeout):
+		t.Fatalf("%s did not come", what)
+	}
+}
+
 // timedJournal keeps the journal records with the moments they were written.
 type timedJournal struct {
 	mu      sync.Mutex
@@ -1824,16 +1824,6 @@ func TestSession_DrainWait(t *testing.T) {
 			return i >= 0
 		}, testTimeout, time.Millisecond)
 		return records.sessionEnd()
-	}
-
-	// wait waits for a signal.
-	wait := func(t *testing.T, signal <-chan struct{}, what string) {
-		t.Helper()
-		select {
-		case <-signal:
-		case <-time.After(testTimeout):
-			t.Fatalf("%s did not come", what)
-		}
 	}
 
 	t.Run("must_pass_session_end_after_pipelines", func(t *testing.T) {

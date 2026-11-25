@@ -5,6 +5,8 @@
 #   ./llm-live-check.sh polza      # APP_LLM_API_KEY (Polza.ai key), APP_LLM_MODEL, APP_VLM_MODEL
 #   ./llm-live-check.sh gigachat   # GIGACHAT_CREDENTIALS, GIGACHAT_MODEL; needs Docker
 #
+# Both take APP_LLM_TTFT_TIMEOUT_MS from the environment; the live check runs with 5000.
+#
 # Keys and model identifiers come only from the environment: a missing one is a
 # failure, not a skip. Keys reach containers by variable name only and are never
 # printed or written to files. cmd/llmbench runs from the gateway image
@@ -47,10 +49,13 @@ gateway_image() {
 }
 
 # llmbench ARGS... - runs cmd/llmbench with the key from APP_LLM_API_KEY and prints its JSON.
+# APP_LLM_TTFT_TIMEOUT_MS goes in by name: raised for the live check (5000), otherwise a
+# slow provider fails with timeout_ttft; when it is not set, the gateway default applies.
 # The reference prompt and the test image are mounted from testdata/llmbench.
 llmbench() {
     docker run --rm --network host \
         -e APP_LLM_API_KEY \
+        -e APP_LLM_TTFT_TIMEOUT_MS \
         -v "$REPO_DIR/testdata/llmbench:/testdata/llmbench:ro" \
         -w / \
         --entrypoint /llmbench \
