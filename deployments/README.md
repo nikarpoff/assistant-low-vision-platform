@@ -292,11 +292,13 @@ docker run --rm -e APP_LLM_API_KEY -v "$PWD/../testdata/llmbench:/testdata/llmbe
 `llm-live-check.sh` проверяет настоящих поставщиков настоящими ключами. В сквозную проверку на заглушках она не входит. Ключи и идентификаторы моделей берутся только из окружения: если переменной нет, скрипт печатает `live: <ПЕРЕМЕННАЯ> is empty` и завершается с кодом 1 - пропуск не считается успехом.
 
 ```bash
+export APP_LLM_TTFT_TIMEOUT_MS=5000
 export APP_LLM_API_KEY=... APP_LLM_MODEL=... APP_VLM_MODEL=...
 ./llm-live-check.sh polza
 # live: polza llm ok model=<model из ответа> ttft_p95_ms=<...>
 # live: polza vlm ok model=<model из ответа>
 
+export APP_LLM_TTFT_TIMEOUT_MS=5000
 export GIGACHAT_CREDENTIALS=... GIGACHAT_MODEL=...
 ./llm-live-check.sh gigachat
 # live: gigachat ok model=<model из ответа> ttft_p95_ms=<...>
@@ -304,6 +306,7 @@ export GIGACHAT_CREDENTIALS=... GIGACHAT_MODEL=...
 
 - `polza`: адрес всегда `https://polza.ai/api/v1`, независимо от `APP_LLM_URL`. `llmbench` делает 1 прогревочный и 5 потоковых запросов с эталонным промптом моделью `APP_LLM_MODEL`, затем 3 запроса со снимком `testdata/llmbench/scene.jpg` моделью `APP_VLM_MODEL`.
 - `gigachat`: поднимает `gpt2giga` из `compose.vm.yml` (профиль `gigachat`, проект `alv-live`) с одноразовым случайным ключом прокси, ждёт `/health` на `127.0.0.1:8104` и запускает `llmbench` на `http://127.0.0.1:8104/v1` моделью `GIGACHAT_MODEL`: 1 прогревочный и 5 потоковых запросов. Прокси останавливается при любом исходе. Порт 8104 должен быть свободен: работающий gpt2giga стенда на время проверки останавливают. Проверка TLS включена, поэтому успех подтверждает и сертификат НУЦ.
+- Таймаут первого токена на время живой проверки поднят: `APP_LLM_TTFT_TIMEOUT_MS=5000` (решение Д-3 задачи 003). Скрипт передаёт переменную в контейнер `llmbench` по имени. Без неё действует значение Шлюза по умолчанию 900 мс, и медленный поставщик даёт отказ `timeout_ttft`: проверка падает не из-за поставщика. Таймаут Шлюза на стенде (PLT-8) от этого не меняется.
 - Запрос засчитан, если пришёл непустой текст, поток завершился нормально и в ответе есть непустой `model`. Любой отказ - код выхода не 0.
 - Ключи передаются в контейнеры только по имени переменной, не печатаются и не пишутся в файлы.
 - `llmbench` берётся из образа `ghcr.io/nikarpoff/assistant-low-vision-platform:${ALV_IMAGE_TAG:-latest}`; с `ALV_LOCAL_BUILD=1` образ собирается из этого репозитория. Нужны Docker и `curl`.
