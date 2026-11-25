@@ -57,6 +57,7 @@ const (
 	maxModelsBodyBytes     = 4 << 20  // the list of a provider with hundreds of models
 	maxDrainBytes          = 64 << 10 // the rest of a finished stream after [DONE]
 	maxErrorDrainBytes     = maxDrainBytes
+	maxErrorTotalBytes     = maxErrorBodyBytes + maxErrorDrainBytes // the whole error body that is read to its end
 )
 
 // errorBodyIdle limits the wait for the next bytes of an error body before the stream:
@@ -391,12 +392,22 @@ func (s *stream) run(ctx context.Context, httpClient *http.Client, httpRequest *
 
 	// Failure before the stream: status and the provider error body
 	if response.StatusCode < 200 || response.StatusCode > 299 {
-		errBody, overLimit := readErrorBody(response.Body, s.cancel)
-		if overLimit && response.ProtoMajor == 1 && conn != nil {
-			// The transport may have pooled the connection if the extra byte was the last
-			// one. An HTTP/2 connection is shared by other requests and stays: closing the
-			// unread body resets only its stream.
-			_ = conn.Close()
+		var errBody []byte
+		if response.ContentLength > maxErrorTotalBytes {
+			// Known length over the limit: only the start for code and trace_id is read, and
+			// the deferred Close ends the body before io.EOF. The transport returns a
+			// connection to the pool only when its body is read to io.EOF, so it drops this
+			// one itself: the connection is not closed here, there is nothing pooled to race.
+			errBody = readErrorBodyStart(response.Body, s.cancel)
+		} else {
+			var overLimit bool
+			errBody, overLimit = readErrorBody(response.Body, s.cancel)
+			if overLimit && response.ProtoMajor == 1 && conn != nil {
+				// The transport may have pooled the connection if the extra byte was the last
+				// one. An HTTP/2 connection is shared by other requests and stays: closing the
+				// unread body resets only its stream.
+				_ = conn.Close()
+			}
 		}
 		code, traceID := parseErrorBody(errBody)
 		return &Error{Reason: reasonForStatus(response.StatusCode), StatusCode: response.StatusCode, Code: code, TraceID: traceID}
@@ -434,13 +445,16 @@ func drain(body io.Reader) {
 	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxDrainBytes))
 }
 
-// readErrorBody reads the error body of a failure before the stream and returns its
-// first maxErrorBodyBytes for parsing. The rest, up to maxErrorDrainBytes, is drained,
-// and one more byte is read: io.EOF right away means the body ended within the limit and
-// the connection goes back to the pool. overLimit is true when the body goes on past the
-// limit: the caller closes the connection, the rest is not read. When no bytes come for
-// errorBodyIdle, cancel ends the request context and the read at once: a body that
-// stalls never delays the answer, and the connection is closed with it.
+// readErrorBody reads the error body of a failure before the stream, of unknown length
+// or of a known length within maxErrorTotalBytes, and returns its first
+// maxErrorBodyBytes for parsing. The rest, up to maxErrorDrainBytes, is drained, and one
+// more byte is read: io.EOF right away means the body ended within the limit and the
+// connection goes back to the pool. overLimit is true when the body goes on past the
+// limit: the caller closes the connection, the rest is not read. The transport may have
+// pooled the connection already if the extra byte came last together with io.EOF, so
+// closing the body alone is not enough here. When no bytes come for errorBodyIdle,
+// cancel ends the request context and the read at once: a body that stalls never delays
+// the answer, and the connection is closed with it.
 func readErrorBody(body io.Reader, cancel context.CancelCauseFunc) (errBody []byte, overLimit bool) {
 	timer := time.AfterFunc(errorBodyIdle, func() { cancel(errErrorBodyStalled) })
 	defer timer.Stop()
@@ -456,6 +470,18 @@ func readErrorBody(body io.Reader, cancel context.CancelCauseFunc) (errBody []by
 	// One byte past the limit tells a body longer than the limit from one that ends at it
 	n, _ := io.ReadFull(reader, make([]byte, 1))
 	return errBody, n > 0
+}
+
+// readErrorBodyStart reads the first maxErrorBodyBytes of an error body whose known
+// length is over maxErrorTotalBytes, with the same idle timeout as readErrorBody. The
+// rest is not read: the body is closed before io.EOF, and the transport never returns
+// such a connection to the pool, so the caller need not close it.
+func readErrorBodyStart(body io.Reader, cancel context.CancelCauseFunc) []byte {
+	timer := time.AfterFunc(errorBodyIdle, func() { cancel(errErrorBodyStalled) })
+	defer timer.Stop()
+
+	errBody, _ := io.ReadAll(io.LimitReader(&idleReader{reader: body, timer: timer}, maxErrorBodyBytes))
+	return errBody
 }
 
 // idleReader restarts the idle timer after every read that brought bytes.
